@@ -229,15 +229,15 @@ if __name__ == "__main__":
     else:
         raise ValueError(
             "Invalid MCP_TRANSPORT. Supported values: "
-            "streamable-http (or streamable_http/streamable/mcp), sse."
+            "streamable-http (or aliases: streamable_http, streamable, mcp), sse."
         )
 
     mcp.settings.host = os.getenv("HOST", "0.0.0.0")
     mcp.settings.port = int(os.getenv("PORT", "8000"))
     default_mcp_path = "/mcp" if transport == "streamable-http" else "/sse"
     mcp_path = os.getenv("MCP_PATH", default_mcp_path)
-    # Keep runtime compatibility across MCP SDK minor versions where
-    # transport-specific settings may differ.
+    # Keep runtime compatibility when transport-specific settings are not
+    # available on the installed MCP SDK.
     if transport == "streamable-http" and hasattr(mcp.settings, "streamable_http_path"):
         mcp.settings.streamable_http_path = mcp_path
     if transport == "sse":
