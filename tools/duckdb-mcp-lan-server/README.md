@@ -17,6 +17,12 @@ pip install -r requirements.txt
 PORT=8000 python server.py
 ```
 
+如果你在同一个终端里频繁切换传输类型（`streamable-http` / `sse`），可先清理当前会话中的相关环境变量：
+
+```bash
+source ./clear-mcp-env.sh
+```
+
 - 默认监听：`0.0.0.0`
 - 默认端口：`8000`（可用环境变量 `PORT` 覆盖）
 - 默认 MCP 传输：`streamable-http`

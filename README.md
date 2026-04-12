@@ -30,6 +30,12 @@ pip install -r requirements.txt
 PORT=8000 python server.py
 ```
 
+如果在同一个终端里反复切换传输类型，先执行：
+
+```bash
+source ./clear-mcp-env.sh
+```
+
 Windows（PowerShell）：
 
 ```powershell
