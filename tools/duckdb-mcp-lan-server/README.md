@@ -100,6 +100,12 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 按顺序去除连续重复记录，支持自定义 `keys`、`partitionBy`、`orderBy`
   - 默认：`keys=["lat","lon","height","speed","angle","vspeed"]`、`partitionBy=["fnum"]`、`orderBy="u_time"`
   - 若 `keys` 中含不存在列，会返回清晰错误并给出缺失列名
+- `workspace_list_files(path=".", recursive=true, include_dirs=false, max_entries=1000)`
+  - 列出工作区文件/目录（路径限制在 `workspaceDir` 内）
+- `workspace_search_files(query, path=".", file_glob="*", case_sensitive=false, max_results=200)`
+  - 在工作区中搜索 UTF-8 文本文件内容，返回匹配文件、行号与行内容
+- `workspace_read_text_file(path, start_line=1, max_lines=2000)`
+  - 以文本方式读取工作区内 UTF-8 文件，支持按行分页读取
 
 ## 常见使用建议（针对约 26MB / 12.4 万行数据）
 

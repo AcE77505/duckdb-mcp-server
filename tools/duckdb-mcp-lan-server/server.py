@@ -68,6 +68,28 @@ def _connect_database() -> duckdb.DuckDBPyConnection:
     return duckdb.connect(database=_duckdb_database_path())
 
 
+def _resolve_workspace_path(path: str | None = None) -> Path:
+    if path is None or not path.strip() or path.strip() == ".":
+        candidate = WORKSPACE_DIR
+    else:
+        candidate = Path(path.strip()).expanduser()
+        if not candidate.is_absolute():
+            candidate = WORKSPACE_DIR / candidate
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(WORKSPACE_DIR)
+    except ValueError as exc:
+        raise ValueError(f"Path escapes workspace: {resolved}") from exc
+    return resolved
+
+
+def _read_utf8_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"File is not valid UTF-8 text: {path}") from exc
+
+
 def _resolve_output_path(csv_path: str, output_path: str | None) -> Path:
     source = _resolve_csv_path(csv_path)
     if output_path:
@@ -423,6 +445,150 @@ def duckdb_dedup_consecutive(
         row_count = con.execute(f'SELECT COUNT(*) FROM "{safe_out}"').fetchone()[0]
 
     return {"outTable": safe_out, "rowCount": int(row_count)}
+
+
+@mcp.tool()
+def workspace_list_files(
+    path: str = ".",
+    recursive: bool = True,
+    include_dirs: bool = False,
+    max_entries: int = 1000,
+) -> dict[str, Any]:
+    """列出工作区中的文件或目录。"""
+    if max_entries <= 0:
+        raise ValueError("max_entries must be > 0.")
+    if max_entries > 10000:
+        raise ValueError("max_entries must be <= 10000.")
+
+    root = _resolve_workspace_path(path)
+    if not root.exists():
+        raise ValueError(f"Path not found: {root}")
+    if not root.is_dir():
+        raise ValueError(f"Path is not a directory: {root}")
+
+    iterator = root.rglob("*") if recursive else root.glob("*")
+    entries: list[dict[str, Any]] = []
+    truncated = False
+    for item in iterator:
+        if item.is_dir() and not include_dirs:
+            continue
+        record: dict[str, Any] = {
+            "path": item.relative_to(WORKSPACE_DIR).as_posix(),
+            "type": "dir" if item.is_dir() else "file",
+        }
+        if item.is_file():
+            record["size"] = int(item.stat().st_size)
+        entries.append(record)
+        if len(entries) >= max_entries:
+            truncated = True
+            break
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "base_path": root.relative_to(WORKSPACE_DIR).as_posix() if root != WORKSPACE_DIR else ".",
+        "recursive": recursive,
+        "include_dirs": include_dirs,
+        "returned": len(entries),
+        "truncated": truncated,
+        "entries": entries,
+    }
+
+
+@mcp.tool()
+def workspace_search_files(
+    query: str,
+    path: str = ".",
+    file_glob: str = "*",
+    case_sensitive: bool = False,
+    max_results: int = 200,
+) -> dict[str, Any]:
+    """在工作区中按文件名过滤后搜索文本内容（UTF-8）。"""
+    if not query or not query.strip():
+        raise ValueError("query cannot be empty.")
+    if max_results <= 0:
+        raise ValueError("max_results must be > 0.")
+    if max_results > 5000:
+        raise ValueError("max_results must be <= 5000.")
+
+    root = _resolve_workspace_path(path)
+    if not root.exists():
+        raise ValueError(f"Path not found: {root}")
+    if not root.is_dir():
+        raise ValueError(f"Path is not a directory: {root}")
+
+    needle = query if case_sensitive else query.lower()
+    matches: list[dict[str, Any]] = []
+    truncated = False
+
+    for file_path in root.rglob(file_glob):
+        if not file_path.is_file():
+            continue
+        try:
+            text = _read_utf8_text(file_path)
+        except ValueError:
+            continue
+
+        lines = text.splitlines()
+        for idx, line in enumerate(lines, start=1):
+            target = line if case_sensitive else line.lower()
+            if needle in target:
+                matches.append(
+                    {
+                        "path": file_path.relative_to(WORKSPACE_DIR).as_posix(),
+                        "line": idx,
+                        "text": line,
+                    }
+                )
+                if len(matches) >= max_results:
+                    truncated = True
+                    break
+        if truncated:
+            break
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "base_path": root.relative_to(WORKSPACE_DIR).as_posix() if root != WORKSPACE_DIR else ".",
+        "query": query,
+        "file_glob": file_glob,
+        "case_sensitive": case_sensitive,
+        "returned": len(matches),
+        "truncated": truncated,
+        "matches": matches,
+    }
+
+
+@mcp.tool()
+def workspace_read_text_file(path: str, start_line: int = 1, max_lines: int = 2000) -> dict[str, Any]:
+    """以文本方式读取工作区内的 UTF-8 文件。"""
+    if start_line <= 0:
+        raise ValueError("start_line must be > 0.")
+    if max_lines <= 0:
+        raise ValueError("max_lines must be > 0.")
+    if max_lines > 10000:
+        raise ValueError("max_lines must be <= 10000.")
+
+    file_path = _resolve_workspace_path(path)
+    if not file_path.exists():
+        raise ValueError(f"File not found: {file_path}")
+    if not file_path.is_file():
+        raise ValueError(f"Path is not a file: {file_path}")
+
+    text = _read_utf8_text(file_path)
+    lines = text.splitlines()
+
+    start_idx = start_line - 1
+    end_idx = min(start_idx + max_lines, len(lines))
+    content = "\n".join(lines[start_idx:end_idx]) if start_idx < len(lines) else ""
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": file_path.relative_to(WORKSPACE_DIR).as_posix(),
+        "start_line": start_line,
+        "end_line": end_idx,
+        "total_lines": len(lines),
+        "truncated": end_idx < len(lines),
+        "content": content,
+    }
 
 
 if __name__ == "__main__":
