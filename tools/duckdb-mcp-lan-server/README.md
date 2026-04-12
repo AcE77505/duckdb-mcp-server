@@ -23,6 +23,12 @@ PORT=8000 python server.py
 source ./clear-mcp-env.sh
 ```
 
+Windows（PowerShell）：
+
+```powershell
+.\clear-mcp-env.ps1
+```
+
 - 默认监听：`0.0.0.0`
 - 默认端口：`8000`（可用环境变量 `PORT` 覆盖）
 - 默认 MCP 传输：`streamable-http`
