@@ -5,7 +5,7 @@
 ## 1) 安装依赖
 
 ```bash
-cd /home/runner/work/duckdb-mcp-server/duckdb-mcp-server/tools/duckdb-mcp-lan-server
+cd tools/duckdb-mcp-lan-server
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -23,7 +23,9 @@ PORT=8000 python server.py
 - 可选环境变量：
   - `HOST`（默认 `0.0.0.0`）
   - `MCP_PATH`（默认 `/mcp`）
-  - `DISABLE_DNS_REBINDING_PROTECTION`（默认 `1`，便于局域网访问）
+  - `ALLOWED_HOSTS`（默认 `*`，逗号分隔）
+  - `ENABLE_DNS_REBINDING_PROTECTION`（默认 `1`）
+  - `DISABLE_DNS_REBINDING_PROTECTION`（兼容旧变量；当它为 `1` 且未设置 `ENABLE_*` 时会关闭防护）
 
 ## 3) rikkahub（Android）配置
 
@@ -36,14 +38,16 @@ PORT=8000 python server.py
 
 - `http://192.168.1.23:8000/mcp`
 
+> 安全提示：默认监听 `0.0.0.0` 会暴露到你的局域网，请仅在可信网络中使用，并避免把端口直接映射到公网。
+
 ## 可用工具
 
-- `describe_csv(csv_path, table_name="tracks")`
+- `describe_csv(csv_path, table_name="tracks", ignore_errors=False)`
   - 返回推断字段和总行数
-- `query_csv(csv_path, sql, table_name="tracks", max_rows=1000)`
-  - 对 CSV 执行 SQL（SQL 中使用 `table_name` 作为表名）
-- `deduplicate_csv(csv_path, key_columns, output_path=None, table_name="tracks", order_by=None)`
-  - 按 key 列去重，输出新的 CSV（默认输出到原文件同目录，文件名追加 `.dedup`）
+- `query_csv(csv_path, sql, table_name="tracks", max_rows=1000, ignore_errors=False)`
+  - 对 CSV 执行 SQL（SQL 中使用 `table_name` 作为表名，`max_rows` 上限 10000）
+- `deduplicate_csv(csv_path, key_columns, output_path=None, table_name="tracks", order_by=None, ignore_errors=False)`
+  - 按 key 列去重，输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.dedup.csv`）
 
 ## 常见使用建议（针对约 26MB / 12.4 万行数据）
 
