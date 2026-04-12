@@ -74,6 +74,20 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 对 CSV 执行 SQL（SQL 中使用 `table_name` 作为表名，`max_rows` 上限 10000）
 - `deduplicate_csv(csv_path, key_columns, output_path=None, table_name="tracks", order_by=None, ignore_errors=False)`
   - 按 key 列去重，输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.dedup.csv`）
+- `duckdb_health()`
+  - 返回 `{ ok, duckdbVersion, dbPath, time }`，用于连通性检测（`time` 为 ISO8601）
+- `duckdb_list_tables(includeViews=true)`
+  - 返回当前数据库中的表和视图：`{ tables, views }`
+- `duckdb_describe(table)`
+  - 返回指定表结构：`{ table, columns: [{ name, type, nullable }] }`
+- `duckdb_preview(table="tracks", limit=50)`
+  - 预览前 N 行：`{ table, rows, rowCount }`
+- `duckdb_dedup_exact(table="tracks", outTable="tracks_dedup_exact")`
+  - 整行去重并写入新表：`CREATE OR REPLACE TABLE outTable AS SELECT DISTINCT * FROM table`
+- `duckdb_dedup_consecutive(table="tracks", outTable="tracks_dedup_consecutive", keys?, partitionBy?, orderBy?)`
+  - 按顺序去除连续重复记录，支持自定义 `keys`、`partitionBy`、`orderBy`
+  - 默认：`keys=["lat","lon","height","speed","angle","vspeed"]`、`partitionBy=["fnum"]`、`orderBy="u_time"`
+  - 若 `keys` 中含不存在列，会返回清晰错误并给出缺失列名
 
 ## 常见使用建议（针对约 26MB / 12.4 万行数据）
 
