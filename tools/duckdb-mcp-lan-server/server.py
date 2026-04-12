@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,14 @@ def _safe_identifier(name: str) -> str:
             "followed by letters, numbers, or underscores."
         )
     return name
+
+
+def _duckdb_database_path() -> str:
+    return str(Path(os.getenv("DUCKDB_PATH", "./duckdb_mcp.db")).expanduser().resolve())
+
+
+def _connect_database() -> duckdb.DuckDBPyConnection:
+    return duckdb.connect(database=_duckdb_database_path())
 
 
 def _resolve_output_path(csv_path: str, output_path: str | None) -> Path:
@@ -89,6 +98,20 @@ def _safe_order_by(order_by: str | None, allowed_columns: set[str], fallback_exp
     return ", ".join(clauses)
 
 
+def _table_columns(con: duckdb.DuckDBPyConnection, table_name: str) -> set[str]:
+    safe_table = _safe_identifier(table_name)
+    rows = con.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = ?
+        """,
+        [safe_table],
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
 def _validate_query_sql(sql: str) -> str:
     normalized = sql.strip()
     if ";" in normalized:
@@ -106,7 +129,7 @@ def _validate_query_sql(sql: str) -> str:
 
 @mcp.tool()
 def describe_csv(csv_path: str, table_name: str = "tracks", ignore_errors: bool = False) -> dict[str, Any]:
-    """Load CSV and return inferred schema + row count."""
+    """读取 CSV 并返回自动推断的字段信息与总行数。"""
     with duckdb.connect(database=":memory:") as con:
         safe_table = _create_or_replace_view(con, table_name, csv_path, ignore_errors)
         columns = con.execute(f'DESCRIBE SELECT * FROM "{safe_table}"').fetchall()
@@ -137,7 +160,7 @@ def query_csv(
     max_rows: int = 1000,
     ignore_errors: bool = False,
 ) -> dict[str, Any]:
-    """Run SQL against CSV. SQL should reference the given table_name."""
+    """对 CSV 执行 SQL 查询（SQL 中请使用 table_name 作为表名）。"""
     if max_rows <= 0:
         raise ValueError("max_rows must be > 0.")
     if max_rows > 10000:
@@ -170,7 +193,7 @@ def deduplicate_csv(
     order_by: str | None = None,
     ignore_errors: bool = False,
 ) -> dict[str, Any]:
-    """Deduplicate CSV by key columns and write new CSV with first row per key."""
+    """按 key 列对 CSV 去重，并输出每组保留一条记录的新 CSV。"""
     if not key_columns:
         raise ValueError("key_columns cannot be empty.")
 
@@ -218,6 +241,143 @@ def deduplicate_csv(
             "rows_after": int(after),
             "removed_rows": int(before - after),
         }
+
+
+@mcp.tool()
+def duckdb_health() -> dict[str, Any]:
+    """快速检查 DuckDB 连通性并返回版本、数据库路径与当前时间。"""
+    with _connect_database() as con:
+        version = con.execute("SELECT version()").fetchone()[0]
+    return {
+        "ok": True,
+        "duckdbVersion": str(version),
+        "dbPath": _duckdb_database_path(),
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@mcp.tool()
+def duckdb_list_tables(includeViews: bool = True) -> dict[str, Any]:
+    """列出当前数据库中的表与视图名称。"""
+    with _connect_database() as con:
+        base_sql = """
+            SELECT table_name, table_type
+            FROM information_schema.tables
+            WHERE table_schema = current_schema()
+              AND table_type IN ('BASE TABLE', 'VIEW')
+            ORDER BY table_name
+        """
+        rows = con.execute(base_sql).fetchall()
+
+    tables = [r[0] for r in rows if r[1] == "BASE TABLE"]
+    views = [r[0] for r in rows if r[1] == "VIEW"]
+    if not includeViews:
+        views = []
+    return {"tables": tables, "views": views}
+
+
+@mcp.tool()
+def duckdb_describe(table: str) -> dict[str, Any]:
+    """返回指定表的字段结构信息。"""
+    safe_table = _safe_identifier(table)
+    with _connect_database() as con:
+        columns = con.execute(
+            f"""
+            SELECT name, type, "notnull"
+            FROM pragma_table_info('{safe_table}')
+            ORDER BY cid
+            """
+        ).fetchall()
+    if not columns:
+        raise ValueError(f"Table not found or has no columns: {safe_table}")
+
+    return {
+        "table": safe_table,
+        "columns": [
+            {"name": col[0], "type": col[1], "nullable": (col[2] == 0)} for col in columns
+        ],
+    }
+
+
+@mcp.tool()
+def duckdb_preview(table: str = "tracks", limit: int = 50) -> dict[str, Any]:
+    """返回指定表前 N 行数据，便于快速预览。"""
+    if limit <= 0:
+        raise ValueError("limit must be > 0.")
+    if limit > 5000:
+        raise ValueError("limit must be <= 5000.")
+
+    safe_table = _safe_identifier(table)
+    with _connect_database() as con:
+        rows = con.execute(f'SELECT * FROM "{safe_table}" LIMIT {int(limit)}').fetchall()
+    return {"table": safe_table, "rows": [list(r) for r in rows], "rowCount": len(rows)}
+
+
+@mcp.tool()
+def duckdb_dedup_exact(table: str = "tracks", outTable: str = "tracks_dedup_exact") -> dict[str, Any]:
+    """对整行完全相同的数据做去重并写入新表。"""
+    safe_table = _safe_identifier(table)
+    safe_out = _safe_identifier(outTable)
+    with _connect_database() as con:
+        con.execute(
+            f'CREATE OR REPLACE TABLE "{safe_out}" AS SELECT DISTINCT * FROM "{safe_table}"'
+        )
+        row_count = con.execute(f'SELECT COUNT(*) FROM "{safe_out}"').fetchone()[0]
+    return {"outTable": safe_out, "rowCount": int(row_count)}
+
+
+@mcp.tool()
+def duckdb_dedup_consecutive(
+    table: str = "tracks",
+    outTable: str = "tracks_dedup_consecutive",
+    keys: list[str] | None = None,
+    partitionBy: list[str] | None = None,
+    orderBy: str | None = None,
+) -> dict[str, Any]:
+    """按分组和顺序去除连续重复行（保留每段连续记录的第一条）。"""
+    safe_table = _safe_identifier(table)
+    safe_out = _safe_identifier(outTable)
+    safe_keys = keys or ["lat", "lon", "height", "speed", "angle", "vspeed"]
+    safe_partition = partitionBy or ["fnum"]
+    safe_keys = [_safe_identifier(k) for k in safe_keys]
+    safe_partition = [_safe_identifier(k) for k in safe_partition]
+
+    with _connect_database() as con:
+        existing_columns = _table_columns(con, safe_table)
+        if not existing_columns:
+            raise ValueError(f"Table not found: {safe_table}")
+
+        missing_keys = [k for k in safe_keys if k not in existing_columns]
+        if missing_keys:
+            raise ValueError(f"Missing key columns: {missing_keys}")
+
+        missing_partition = [k for k in safe_partition if k not in existing_columns]
+        if missing_partition:
+            raise ValueError(f"Missing partitionBy columns: {missing_partition}")
+
+        order_expr = _safe_order_by(orderBy, existing_columns, '"u_time" ASC')
+        partition_expr = ", ".join(f'"{k}"' for k in safe_partition)
+        equals_expr = " AND ".join(
+            [f'("{k}" IS NOT DISTINCT FROM LAG("{k}") OVER w)' for k in safe_keys]
+        )
+
+        con.execute(
+            f"""
+            CREATE OR REPLACE TABLE "{safe_out}" AS
+            WITH marked AS (
+                SELECT *,
+                       CASE WHEN {equals_expr} THEN 0 ELSE 1 END AS __keep
+                FROM "{safe_table}"
+                WINDOW w AS (PARTITION BY {partition_expr} ORDER BY {order_expr})
+            )
+            SELECT * EXCLUDE (__keep)
+            FROM marked
+            WHERE __keep = 1
+            """
+        )
+        row_count = con.execute(f'SELECT COUNT(*) FROM "{safe_out}"').fetchone()[0]
+
+    return {"outTable": safe_out, "rowCount": int(row_count)}
 
 
 if __name__ == "__main__":
