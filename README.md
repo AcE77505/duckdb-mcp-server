@@ -3,3 +3,32 @@
 ## Projects
 
 - `tools/duckdb-mcp-lan-server`: 局域网可访问的 DuckDB MCP Streamable HTTP 服务（用于大 CSV SQL 分析与去重）
+
+## 部署教程（duckdb-mcp-lan-server）
+
+### 1) 安装依赖
+
+```bash
+cd /home/runner/work/duckdb-mcp-server/duckdb-mcp-server/tools/duckdb-mcp-lan-server
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 2) 启动服务
+
+```bash
+PORT=8000 python server.py
+```
+
+- 默认监听：`0.0.0.0`
+- 默认端口：`8000`（可通过 `PORT` 覆盖）
+- MCP 地址：`http://<你的电脑局域网IP>:8000/mcp`
+
+### 3) 手机同 Wi‑Fi 连接（rikkahub）
+
+- URL 填：`http://<你的电脑局域网IP>:8000/mcp`
+- Headers 可留空
+
+更多配置与工具说明见：
+`/home/runner/work/duckdb-mcp-server/duckdb-mcp-server/tools/duckdb-mcp-lan-server/README.md`
