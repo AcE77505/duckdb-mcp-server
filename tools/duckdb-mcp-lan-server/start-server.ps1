@@ -25,11 +25,11 @@ function Get-VenvPythonPath {
         return $posixPython
     }
 
-    return $windowsPython
+    return $null
 }
 
 $venvPython = Get-VenvPythonPath -VenvRoot $venvDir
-if (-not (Test-Path $venvPython)) {
+if (-not $venvPython -or -not (Test-Path $venvPython)) {
     Write-Host "Creating virtual environment..."
     Push-Location $scriptDir
     try {
@@ -50,8 +50,8 @@ if (-not (Test-Path $venvPython)) {
     $venvPython = Get-VenvPythonPath -VenvRoot $venvDir
 }
 
-if (-not (Test-Path $venvPython)) {
-    throw "Virtual environment Python not found: $venvPython"
+if (-not $venvPython -or -not (Test-Path $venvPython)) {
+    throw "Virtual environment Python executable not found in: $venvDir"
 }
 
 $requirementsHash = (Get-FileHash -Path $requirementsPath -Algorithm SHA256).Hash
