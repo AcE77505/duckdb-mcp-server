@@ -40,11 +40,6 @@ Windows（PowerShell）：
 
 ```powershell
 .\clear-mcp-env.ps1
-```
-
-Windows（PowerShell）：
-
-```powershell
 $env:PORT=8000
 python server.py
 ```
