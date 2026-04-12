@@ -221,16 +221,12 @@ def deduplicate_csv(
 
 
 if __name__ == "__main__":
-    transport_aliases = {
-        "streamable-http": "streamable-http",
-        "streamable_http": "streamable-http",
-        "streamable": "streamable-http",
-        "mcp": "streamable-http",
-        "sse": "sse",
-    }
     raw_transport = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
-    transport = transport_aliases.get(raw_transport)
-    if transport is None:
+    if raw_transport in {"streamable-http", "streamable_http", "streamable", "mcp"}:
+        transport = "streamable-http"
+    elif raw_transport == "sse":
+        transport = "sse"
+    else:
         raise ValueError(
             "Invalid MCP_TRANSPORT. Supported values: "
             "streamable-http (or streamable_http/streamable/mcp), sse."
@@ -240,6 +236,8 @@ if __name__ == "__main__":
     mcp.settings.port = int(os.getenv("PORT", "8000"))
     default_mcp_path = "/mcp" if transport == "streamable-http" else "/sse"
     mcp_path = os.getenv("MCP_PATH", default_mcp_path)
+    # Keep runtime compatibility across MCP SDK minor versions where
+    # transport-specific settings may differ.
     if transport == "streamable-http" and hasattr(mcp.settings, "streamable_http_path"):
         mcp.settings.streamable_http_path = mcp_path
     if transport == "sse":
