@@ -1,6 +1,6 @@
 param(
     [int]$Port = 8000,
-    [string]$Host = "0.0.0.0",
+    [string]$BindHost = "0.0.0.0",
     [ValidateSet("0", "1")]
     [string]$EnableDnsRebindingProtection = "0"
 )
@@ -9,33 +9,49 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venvDir = Join-Path $scriptDir ".venv"
-$venvPython = Join-Path $venvDir "Scripts/python.exe"
 $requirementsPath = Join-Path $scriptDir "requirements.txt"
 $requirementsHashPath = Join-Path $venvDir ".requirements.sha256"
 
-function Get-SystemPython {
-    $python = Get-Command python -ErrorAction SilentlyContinue
-    if ($python) {
-        return "python"
+function Get-VenvPythonPath {
+    param([string]$VenvRoot)
+
+    $windowsPython = Join-Path $VenvRoot "Scripts/python.exe"
+    if (Test-Path $windowsPython) {
+        return $windowsPython
     }
 
-    $py = Get-Command py -ErrorAction SilentlyContinue
-    if ($py) {
-        return "py -3"
+    $posixPython = Join-Path $VenvRoot "bin/python"
+    if (Test-Path $posixPython) {
+        return $posixPython
     }
 
-    throw "Python is not installed or not in PATH."
+    return $windowsPython
 }
 
+$venvPython = Get-VenvPythonPath -VenvRoot $venvDir
 if (-not (Test-Path $venvPython)) {
     Write-Host "Creating virtual environment..."
     Push-Location $scriptDir
     try {
-        $pythonCmd = Get-SystemPython
-        Invoke-Expression "$pythonCmd -m venv .venv"
+        $python = Get-Command python -ErrorAction SilentlyContinue
+        if ($python) {
+            & $python.Source -m venv .venv
+        } else {
+            $py = Get-Command py -ErrorAction SilentlyContinue
+            if ($py) {
+                & $py.Source -3 -m venv .venv
+            } else {
+                throw "Python is not installed or not in PATH."
+            }
+        }
     } finally {
         Pop-Location
     }
+    $venvPython = Get-VenvPythonPath -VenvRoot $venvDir
+}
+
+if (-not (Test-Path $venvPython)) {
+    throw "Virtual environment Python not found: $venvPython"
 }
 
 $requirementsHash = (Get-FileHash -Path $requirementsPath -Algorithm SHA256).Hash
@@ -53,8 +69,8 @@ if ($requirementsHash -ne $installedHash) {
 }
 
 $env:ENABLE_DNS_REBINDING_PROTECTION = $EnableDnsRebindingProtection
-$env:HOST = $Host
+$env:HOST = $BindHost
 $env:PORT = "$Port"
 
-Write-Host "Starting server on ${Host}:${Port} (ENABLE_DNS_REBINDING_PROTECTION=$EnableDnsRebindingProtection)..."
+Write-Host "Starting server on ${BindHost}:${Port} (ENABLE_DNS_REBINDING_PROTECTION=$EnableDnsRebindingProtection)..."
 & $venvPython (Join-Path $scriptDir "server.py")

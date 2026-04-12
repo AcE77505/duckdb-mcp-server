@@ -16,7 +16,7 @@ cd tools/duckdb-mcp-lan-server
 - 首次运行会自动创建 `.venv` 并安装依赖
 - 后续启动会复用 `.venv`，仅当 `requirements.txt` 变化时才重新安装依赖
 - 脚本默认设置 `ENABLE_DNS_REBINDING_PROTECTION=0`
-- 可选参数示例：`.\start-server.ps1 -Port 8000 -Host 0.0.0.0 -EnableDnsRebindingProtection 0`
+- 可选参数示例：`.\start-server.ps1 -Port 8000 -BindHost 0.0.0.0 -EnableDnsRebindingProtection 0`
 
 ## 2) 手动安装依赖（可选）
 
