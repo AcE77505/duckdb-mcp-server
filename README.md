@@ -9,7 +9,7 @@
 ### 1) 安装依赖
 
 ```bash
-cd /home/runner/work/duckdb-mcp-server/duckdb-mcp-server/tools/duckdb-mcp-lan-server
+cd tools/duckdb-mcp-lan-server
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -58,4 +58,4 @@ python server.py
 客户端 URL 改为：`http://<你的电脑局域网IP>:8000/sse`
 
 更多配置与工具说明见：
-`/home/runner/work/duckdb-mcp-server/duckdb-mcp-server/tools/duckdb-mcp-lan-server/README.md`
+`tools/duckdb-mcp-lan-server/README.md`
