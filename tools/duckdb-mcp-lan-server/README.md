@@ -19,10 +19,13 @@ PORT=8000 python server.py
 
 - 默认监听：`0.0.0.0`
 - 默认端口：`8000`（可用环境变量 `PORT` 覆盖）
-- MCP Streamable HTTP URL 默认是：`http://<你的电脑IP>:8000/mcp`
+- 默认 MCP 传输：`streamable-http`
+- Streamable HTTP URL 默认是：`http://<你的电脑IP>:8000/mcp`
 - 可选环境变量：
   - `HOST`（默认 `0.0.0.0`）
-  - `MCP_PATH`（默认 `/mcp`）
+  - `MCP_TRANSPORT`（默认 `streamable-http`；可选 `sse`）
+  - `MCP_PATH`（`streamable-http` 默认 `/mcp`；`sse` 默认 `/sse`）
+  - `MCP_MESSAGE_PATH`（仅 `sse` 生效，默认 `/messages`）
   - `ALLOWED_HOSTS`（默认 `*`，逗号分隔）
   - `ENABLE_DNS_REBINDING_PROTECTION`（默认 `1`）
   - `DISABLE_DNS_REBINDING_PROTECTION`（兼容旧变量；当它为 `1` 且未设置 `ENABLE_*` 时会关闭防护）
@@ -37,6 +40,17 @@ PORT=8000 python server.py
 示例（电脑 IP 为 `192.168.1.23`）：
 
 - `http://192.168.1.23:8000/mcp`
+
+如果你看到 `406 Not Acceptable` 且提示 `Client must accept text/event-stream`：
+
+- 这通常表示客户端没有按 Streamable HTTP 方式发起请求（比如直接浏览器访问，或客户端协议不兼容）
+- 可切换为 SSE 兼容模式再试：
+
+```bash
+MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
+```
+
+然后在客户端把 URL 改为：`http://<你的电脑IP>:8000/sse`
 
 > 安全提示：默认监听 `0.0.0.0` 会暴露到你的局域网，请仅在可信网络中使用，并避免把端口直接映射到公网。
 

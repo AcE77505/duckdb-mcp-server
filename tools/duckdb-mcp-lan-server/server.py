@@ -221,9 +221,32 @@ def deduplicate_csv(
 
 
 if __name__ == "__main__":
+    transport_aliases = {
+        "streamable-http": "streamable-http",
+        "streamable_http": "streamable-http",
+        "streamable": "streamable-http",
+        "mcp": "streamable-http",
+        "sse": "sse",
+    }
+    raw_transport = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
+    transport = transport_aliases.get(raw_transport)
+    if transport is None:
+        raise ValueError(
+            "Invalid MCP_TRANSPORT. Supported values: "
+            "streamable-http (or streamable_http/streamable/mcp), sse."
+        )
+
     mcp.settings.host = os.getenv("HOST", "0.0.0.0")
     mcp.settings.port = int(os.getenv("PORT", "8000"))
-    mcp.settings.streamable_http_path = os.getenv("MCP_PATH", "/mcp")
+    default_mcp_path = "/mcp" if transport == "streamable-http" else "/sse"
+    mcp_path = os.getenv("MCP_PATH", default_mcp_path)
+    if transport == "streamable-http" and hasattr(mcp.settings, "streamable_http_path"):
+        mcp.settings.streamable_http_path = mcp_path
+    if transport == "sse":
+        if hasattr(mcp.settings, "sse_path"):
+            mcp.settings.sse_path = mcp_path
+        if hasattr(mcp.settings, "message_path"):
+            mcp.settings.message_path = os.getenv("MCP_MESSAGE_PATH", "/messages")
     enable_dns_rebinding_protection = os.getenv("ENABLE_DNS_REBINDING_PROTECTION")
     if enable_dns_rebinding_protection is None:
         enable_dns_rebinding_protection = (
@@ -237,4 +260,4 @@ if __name__ == "__main__":
         for item in os.getenv("ALLOWED_HOSTS", "*").split(",")
         if item.strip()
     ]
-    mcp.run(transport="streamable-http")
+    mcp.run(transport=transport)
