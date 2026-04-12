@@ -229,7 +229,8 @@ if __name__ == "__main__":
     else:
         raise ValueError(
             "Invalid MCP_TRANSPORT. Supported values: "
-            "streamable-http (or aliases: streamable_http, streamable, mcp), sse."
+            "streamable-http (or aliases: streamable_http, streamable, mcp), "
+            "or sse (only 'sse')."
         )
 
     mcp.settings.host = os.getenv("HOST", "0.0.0.0")
@@ -245,6 +246,8 @@ if __name__ == "__main__":
             mcp.settings.sse_path = mcp_path
         if hasattr(mcp.settings, "message_path"):
             mcp.settings.message_path = os.getenv("MCP_MESSAGE_PATH", "/messages")
+    # Backward compatibility: prefer ENABLE_DNS_REBINDING_PROTECTION, but
+    # still support legacy DISABLE_DNS_REBINDING_PROTECTION.
     enable_dns_rebinding_protection = os.getenv("ENABLE_DNS_REBINDING_PROTECTION")
     if enable_dns_rebinding_protection is None:
         enable_dns_rebinding_protection = (
