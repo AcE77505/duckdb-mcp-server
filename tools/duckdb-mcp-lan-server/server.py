@@ -54,6 +54,14 @@ def _safe_identifier(name: str) -> str:
     return name
 
 
+def _quote_identifier(name: str) -> str:
+    if not name:
+        raise ValueError("Identifier cannot be empty.")
+    if "\x00" in name:
+        raise ValueError("Identifier cannot contain NUL characters.")
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _duckdb_database_path() -> str:
     raw = os.getenv("DUCKDB_PATH")
     if raw:
@@ -153,7 +161,7 @@ def _safe_order_by(order_by: str | None, allowed_columns: set[str], fallback_exp
                 "Each clause must be: column_name [ASC|DESC]."
             )
 
-        column = _safe_identifier(parts[0])
+        column = parts[0]
         if column not in allowed_columns:
             raise ValueError(f"Unknown column in order_by: {column}")
 
@@ -163,7 +171,7 @@ def _safe_order_by(order_by: str | None, allowed_columns: set[str], fallback_exp
             if direction not in ("ASC", "DESC"):
                 raise ValueError("Invalid order direction. Use ASC or DESC.")
 
-        clauses.append(f'"{column}" {direction}')
+        clauses.append(f"{_quote_identifier(column)} {direction}")
 
     if not clauses:
         raise ValueError("order_by must contain at least one valid column clause.")
@@ -272,13 +280,15 @@ def deduplicate_csv(
     with duckdb.connect(database=":memory:") as con:
         safe_table = _create_or_replace_view(con, table_name, csv_path, ignore_errors)
         allowed_columns = _list_columns(con, safe_table)
-        safe_keys = [_safe_identifier(k) for k in key_columns]
+        safe_keys = [k.strip() for k in key_columns]
+        if any(not k for k in safe_keys):
+            raise ValueError("key_columns cannot contain empty names.")
         missing = [k for k in safe_keys if k not in allowed_columns]
         if missing:
             raise ValueError(f"Unknown key columns: {missing}")
         target = _resolve_output_path(csv_path, output_path)
 
-        partition_expr = ", ".join(f'"{k}"' for k in safe_keys)
+        partition_expr = ", ".join(_quote_identifier(k) for k in safe_keys)
         order_expr = _safe_order_by(order_by, allowed_columns, partition_expr)
 
         before = con.execute(f'SELECT COUNT(*) FROM "{safe_table}"').fetchone()[0]
