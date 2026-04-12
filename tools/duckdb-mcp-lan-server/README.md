@@ -20,6 +20,10 @@ PORT=8000 python server.py
 - 默认监听：`0.0.0.0`
 - 默认端口：`8000`（可用环境变量 `PORT` 覆盖）
 - MCP Streamable HTTP URL 默认是：`http://<你的电脑IP>:8000/mcp`
+- 可选环境变量：
+  - `HOST`（默认 `0.0.0.0`）
+  - `MCP_PATH`（默认 `/mcp`）
+  - `DISABLE_DNS_REBINDING_PROTECTION`（默认 `1`，便于局域网访问）
 
 ## 3) rikkahub（Android）配置
 

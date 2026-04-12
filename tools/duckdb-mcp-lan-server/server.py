@@ -153,7 +153,10 @@ def deduplicate_csv(
 
 
 if __name__ == "__main__":
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    mount_path = os.getenv("MCP_MOUNT_PATH", "/mcp")
-    mcp.run(transport="streamable-http", host=host, port=port, mount_path=mount_path)
+    mcp.settings.host = os.getenv("HOST", "0.0.0.0")
+    mcp.settings.port = int(os.getenv("PORT", "8000"))
+    mcp.settings.streamable_http_path = os.getenv("MCP_PATH", "/mcp")
+    mcp.settings.transport_security.enable_dns_rebinding_protection = (
+        os.getenv("DISABLE_DNS_REBINDING_PROTECTION", "1") != "1"
+    )
+    mcp.run(transport="streamable-http")
