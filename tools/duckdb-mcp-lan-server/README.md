@@ -17,6 +17,18 @@ pip install -r requirements.txt
 PORT=8000 python server.py
 ```
 
+服务会读取同目录下的 `mcp.config.json` 来确定 MCP 工作目录：
+
+```json
+{
+  "workspaceDir": "workspace"
+}
+```
+
+- 默认工作目录：`server.py` 同目录下的 `workspace/`
+- 若配置相对路径，会以 `server.py` 所在目录为基准解析
+- 启动时会自动创建该目录
+
 如果你在同一个终端里频繁切换传输类型（`streamable-http` / `sse`），可先清理当前会话中的相关环境变量：
 
 ```bash

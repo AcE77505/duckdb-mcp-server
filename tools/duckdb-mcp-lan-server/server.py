@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,38 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("duckdb-mcp-lan-server", json_response=True)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SERVER_DIR = Path(__file__).resolve().parent
+_CONFIG_PATH = _SERVER_DIR / "mcp.config.json"
+_DEFAULT_WORKSPACE_DIR = _SERVER_DIR / "workspace"
+
+
+def _load_mcp_config() -> dict[str, Any]:
+    if not _CONFIG_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid config JSON: {_CONFIG_PATH}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config root must be an object: {_CONFIG_PATH}")
+    return raw
+
+
+def _resolve_workspace_dir() -> Path:
+    config = _load_mcp_config()
+    raw = config.get("workspaceDir")
+    if raw is None:
+        return _DEFAULT_WORKSPACE_DIR.resolve()
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("workspaceDir in mcp.config.json must be a non-empty string.")
+    path = Path(raw.strip()).expanduser()
+    if not path.is_absolute():
+        path = (_SERVER_DIR / path).resolve()
+    return path.resolve()
+
+
+WORKSPACE_DIR = _resolve_workspace_dir()
+WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _safe_identifier(name: str) -> str:
@@ -22,7 +55,13 @@ def _safe_identifier(name: str) -> str:
 
 
 def _duckdb_database_path() -> str:
-    return str(Path(os.getenv("DUCKDB_PATH", "./duckdb_mcp.db")).expanduser().resolve())
+    raw = os.getenv("DUCKDB_PATH")
+    if raw:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = WORKSPACE_DIR / path
+        return str(path.resolve())
+    return str((WORKSPACE_DIR / "duckdb_mcp.db").resolve())
 
 
 def _connect_database() -> duckdb.DuckDBPyConnection:
@@ -32,12 +71,18 @@ def _connect_database() -> duckdb.DuckDBPyConnection:
 def _resolve_output_path(csv_path: str, output_path: str | None) -> Path:
     source = _resolve_csv_path(csv_path)
     if output_path:
-        return Path(output_path).expanduser().resolve()
+        path = Path(output_path).expanduser()
+        if not path.is_absolute():
+            path = WORKSPACE_DIR / path
+        return path.resolve()
     return source.with_name(f"{source.stem}.dedup.csv")
 
 
 def _resolve_csv_path(csv_path: str) -> Path:
-    path = Path(csv_path).expanduser().resolve()
+    path = Path(csv_path).expanduser()
+    if not path.is_absolute():
+        path = WORKSPACE_DIR / path
+    path = path.resolve()
     if not path.exists() or not path.is_file():
         raise ValueError(f"CSV file not found: {path}")
     return path
@@ -381,6 +426,7 @@ def duckdb_dedup_consecutive(
 
 
 if __name__ == "__main__":
+    os.chdir(WORKSPACE_DIR)
     raw_transport = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
     if raw_transport in {"streamable-http", "streamable_http", "streamable", "mcp"}:
         transport = "streamable-http"
