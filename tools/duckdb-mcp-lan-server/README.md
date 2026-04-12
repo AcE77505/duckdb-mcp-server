@@ -2,7 +2,23 @@
 
 一个可在局域网中访问的 MCP Streamable HTTP 服务，用 DuckDB 对大 CSV 做 SQL 分析和去重。
 
-## 1) 安装依赖
+## 1) 一键启动（推荐）
+
+Windows（PowerShell）：
+
+```powershell
+cd tools/duckdb-mcp-lan-server
+.\start-server.ps1
+```
+
+说明：
+
+- 首次运行会自动创建 `.venv` 并安装依赖
+- 后续启动会复用 `.venv`，仅当 `requirements.txt` 变化时才重新安装依赖
+- 脚本默认设置 `ENABLE_DNS_REBINDING_PROTECTION=0`
+- 可选参数示例：`.\start-server.ps1 -Port 8000 -Host 0.0.0.0 -EnableDnsRebindingProtection 0`
+
+## 2) 手动安装依赖（可选）
 
 ```bash
 cd tools/duckdb-mcp-lan-server
@@ -11,7 +27,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 2) 启动服务（一条命令）
+## 3) 手动启动服务（一条命令）
 
 ```bash
 PORT=8000 python server.py
@@ -54,7 +70,7 @@ Windows（PowerShell）：
   - `ENABLE_DNS_REBINDING_PROTECTION`（默认 `1`）
   - `DISABLE_DNS_REBINDING_PROTECTION`（兼容旧变量；当它为 `1` 且未设置 `ENABLE_*` 时会关闭防护）
 
-## 3) rikkahub（Android）配置
+## 4) rikkahub（Android）配置
 
 手机和电脑连接同一 Wi‑Fi 后，在 rikkahub 的 MCP 配置页填写：
 
