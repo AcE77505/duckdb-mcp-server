@@ -90,6 +90,10 @@ def _read_utf8_text(path: Path) -> str:
         raise ValueError(f"File is not valid UTF-8 text: {path}") from exc
 
 
+def _sql_string_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _resolve_output_path(csv_path: str, output_path: str | None) -> Path:
     source = _resolve_csv_path(csv_path)
     if output_path:
@@ -115,13 +119,14 @@ def _create_or_replace_view(
 ) -> str:
     safe_table = _safe_identifier(table_name)
     source = _resolve_csv_path(csv_path)
+    source_literal = _sql_string_literal(str(source))
+    ignore_errors_literal = "true" if ignore_errors else "false"
     con.execute(
         f"""
         CREATE OR REPLACE VIEW "{safe_table}" AS
         SELECT *
-        FROM read_csv_auto(?, sample_size=-1, ignore_errors=?)
-        """,
-        [str(source), ignore_errors],
+        FROM read_csv_auto({source_literal}, sample_size=-1, ignore_errors={ignore_errors_literal})
+        """
     )
     return safe_table
 
@@ -277,6 +282,8 @@ def deduplicate_csv(
         order_expr = _safe_order_by(order_by, allowed_columns, partition_expr)
 
         before = con.execute(f'SELECT COUNT(*) FROM "{safe_table}"').fetchone()[0]
+        target_literal = _sql_string_literal(str(target))
+        ignore_errors_literal = "true" if ignore_errors else "false"
         dedup_sql = f"""
             COPY (
                 SELECT * EXCLUDE (__rn)
@@ -287,16 +294,15 @@ def deduplicate_csv(
                 )
                 WHERE __rn = 1
             )
-            TO ?
+            TO {target_literal}
             WITH (FORMAT CSV, HEADER true)
         """
-        con.execute(dedup_sql, [str(target)])
+        con.execute(dedup_sql)
         after = con.execute(
             f"""
             SELECT COUNT(*)
-            FROM read_csv_auto(?, sample_size=-1, ignore_errors=?)
-            """,
-            [str(target), ignore_errors],
+            FROM read_csv_auto({target_literal}, sample_size=-1, ignore_errors={ignore_errors_literal})
+            """
         ).fetchone()[0]
 
         return {
