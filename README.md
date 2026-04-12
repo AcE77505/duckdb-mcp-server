@@ -15,10 +15,26 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Windows（PowerShell）：
+
+```powershell
+cd .\tools\duckdb-mcp-lan-server
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
 ### 2) 启动服务
 
 ```bash
 PORT=8000 python server.py
+```
+
+Windows（PowerShell）：
+
+```powershell
+$env:PORT=8000
+python server.py
 ```
 
 - 默认监听：`0.0.0.0`
