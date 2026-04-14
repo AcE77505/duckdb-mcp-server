@@ -120,6 +120,15 @@ def _read_utf8_text(path: Path) -> str:
         raise ValueError(f"File is not valid UTF-8 text: {path}") from exc
 
 
+def _resolve_writable_workspace_text_file() -> Path:
+    file_path = _resolve_workspace_path(_WORKSPACE_WRITABLE_TEXT_FILE)
+    if not file_path.exists():
+        raise ValueError(f"File not found: {file_path}")
+    if not file_path.is_file():
+        raise ValueError(f"Path is not a file: {file_path}")
+    return file_path
+
+
 def _sql_string_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -716,11 +725,7 @@ def workspace_read_text_file(path: str, start_line: int = 1, max_lines: int = 20
 @mcp.tool()
 def workspace_write_text_file(content: str, append: bool = False) -> dict[str, Any]:
     """写入工作区内已存在的 add.txt（仅允许该文件）。"""
-    file_path = _resolve_workspace_path(_WORKSPACE_WRITABLE_TEXT_FILE)
-    if not file_path.exists():
-        raise ValueError(f"File not found: {file_path}")
-    if not file_path.is_file():
-        raise ValueError(f"Path is not a file: {file_path}")
+    file_path = _resolve_writable_workspace_text_file()
 
     mode = "a" if append else "w"
     with file_path.open(mode, encoding="utf-8") as f:
@@ -731,6 +736,58 @@ def workspace_write_text_file(content: str, append: bool = False) -> dict[str, A
         "path": file_path.relative_to(WORKSPACE_DIR).as_posix(),
         "append": append,
         "bytes_written": len(content.encode("utf-8")),
+        "file_size": int(file_path.stat().st_size),
+    }
+
+
+@mcp.tool()
+def workspace_replace_text_in_line(
+    line_number: int,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = False,
+) -> dict[str, Any]:
+    """在 add.txt 指定行内替换文本片段。"""
+    if line_number <= 0:
+        raise ValueError("line_number must be > 0.")
+    if old_text == "":
+        raise ValueError("old_text cannot be empty.")
+
+    file_path = _resolve_writable_workspace_text_file()
+    text = _read_utf8_text(file_path)
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        raise ValueError("Target file is empty.")
+    if line_number > len(lines):
+        raise ValueError(f"line_number out of range: {line_number} > {len(lines)}")
+
+    idx = line_number - 1
+    original_line = lines[idx]
+    line_break = ""
+    line_body = original_line
+    for candidate in ("\r\n", "\n", "\r"):
+        if original_line.endswith(candidate):
+            line_break = candidate
+            line_body = original_line[: -len(candidate)]
+            break
+
+    match_count = line_body.count(old_text)
+    if match_count == 0:
+        raise ValueError("old_text not found in target line.")
+
+    replaced_count = match_count if replace_all else 1
+    updated_body = line_body.replace(old_text, new_text, replaced_count)
+    lines[idx] = updated_body + line_break
+    file_path.write_text("".join(lines), encoding="utf-8")
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": file_path.relative_to(WORKSPACE_DIR).as_posix(),
+        "line_number": line_number,
+        "replace_all": replace_all,
+        "replaced_count": replaced_count,
+        "line_before": line_body,
+        "line_after": updated_body,
         "file_size": int(file_path.stat().st_size),
     }
 
