@@ -9,12 +9,24 @@ import duckdb
 from mcp.server.fastmcp import FastMCP
 from pypdf import PdfReader
 
+try:
+    import fitz  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional dependency
+    fitz = None
+
+try:
+    from rapidocr_onnxruntime import RapidOCR  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional dependency
+    RapidOCR = None
+
 
 mcp = FastMCP("duckdb-mcp-lan-server", json_response=True)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SERVER_DIR = Path(__file__).resolve().parent
 _CONFIG_PATH = _SERVER_DIR / "mcp.config.json"
 _DEFAULT_WORKSPACE_DIR = _SERVER_DIR / "workspace"
+_FZBOOKMAKER_GARBLED_RE = re.compile(r"[\u7280-\u733f]")
+_FZBOOKMAKER_GNAME_RE = re.compile(r"/G[0-9A-F]{2}")
 
 
 def _load_mcp_config() -> dict[str, Any]:
@@ -139,6 +151,67 @@ def _read_pdf(pdf_path: str) -> tuple[Path, PdfReader]:
     except Exception as exc:  # pragma: no cover - parser/library errors
         raise ValueError(f"Failed to read PDF: {resolved}") from exc
     return resolved, reader
+
+
+def _looks_like_fzbookmaker_garbled(text: str) -> bool:
+    if not text:
+        return False
+    garbled_hits = len(_FZBOOKMAKER_GARBLED_RE.findall(text))
+    gname_hits = len(_FZBOOKMAKER_GNAME_RE.findall(text))
+    if garbled_hits >= 8:
+        return True
+    if gname_hits >= 5:
+        return True
+    if len(text) >= 120 and (garbled_hits + gname_hits) / len(text) >= 0.05:
+        return True
+    return False
+
+
+def _extract_page_text_with_fallback(
+    page_index: int,
+    page_obj: Any,
+    enable_ocr_fallback: bool,
+    ocr_doc: Any | None = None,
+    ocr_engine: Any | None = None,
+) -> tuple[str, str]:
+    text = page_obj.extract_text() or ""
+    if not enable_ocr_fallback or not _looks_like_fzbookmaker_garbled(text):
+        return text, "text-layer"
+    if ocr_doc is None or ocr_engine is None:
+        return text, "text-layer"
+
+    try:
+        pix = ocr_doc[page_index].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        image_bytes = pix.tobytes("png")
+        ocr_result, _ = ocr_engine(image_bytes)
+        if not ocr_result:
+            return text, "text-layer"
+
+        lines: list[str] = []
+        for item in ocr_result:
+            if len(item) < 2:
+                continue
+            line_text = str(item[1]).strip()
+            if line_text:
+                lines.append(line_text)
+        if not lines:
+            return text, "text-layer"
+        return "\n".join(lines), "ocr-fallback"
+    except Exception:
+        return text, "text-layer"
+
+
+def _build_ocr_fallback_resources(pdf_file: Path, enable_ocr_fallback: bool) -> tuple[Any | None, Any | None]:
+    if not enable_ocr_fallback:
+        return None, None
+    if fitz is None or RapidOCR is None:
+        return None, None
+    try:
+        doc = fitz.open(str(pdf_file))
+        ocr = RapidOCR()
+        return doc, ocr
+    except Exception:
+        return None, None
 
 
 def _create_or_replace_view(
@@ -679,7 +752,12 @@ def pdf_get_structure(pdf_path: str, max_toc_items: int = 2000) -> dict[str, Any
 
 
 @mcp.tool()
-def pdf_read_pages(pdf_path: str, start_page: int = 1, max_pages: int = 10) -> dict[str, Any]:
+def pdf_read_pages(
+    pdf_path: str,
+    start_page: int = 1,
+    max_pages: int = 10,
+    ocr_fallback: bool = True,
+) -> dict[str, Any]:
     """按页读取 PDF 文本内容，并返回每页文本与图像数量统计。"""
     if start_page <= 0:
         raise ValueError("start_page must be > 0.")
@@ -694,22 +772,30 @@ def pdf_read_pages(pdf_path: str, start_page: int = 1, max_pages: int = 10) -> d
     end_idx = min(start_idx + max_pages, total_pages)
 
     pages: list[dict[str, Any]] = []
-    for page_idx in range(start_idx, end_idx):
-        page = reader.pages[page_idx]
-        text = page.extract_text() or ""
-        image_count = 0
-        try:
-            image_count = len(list(page.images))
-        except Exception:
+    ocr_doc, ocr_engine = _build_ocr_fallback_resources(resolved, ocr_fallback)
+    try:
+        for page_idx in range(start_idx, end_idx):
+            page = reader.pages[page_idx]
+            text, text_source = _extract_page_text_with_fallback(
+                page_idx, page, ocr_fallback, ocr_doc, ocr_engine
+            )
             image_count = 0
-        pages.append(
-            {
-                "page": page_idx + 1,
-                "char_count": len(text),
-                "image_count": int(image_count),
-                "text": text,
-            }
-        )
+            try:
+                image_count = len(list(page.images))
+            except Exception:
+                image_count = 0
+            pages.append(
+                {
+                    "page": page_idx + 1,
+                    "char_count": len(text),
+                    "image_count": int(image_count),
+                    "text_source": text_source,
+                    "text": text,
+                }
+            )
+    finally:
+        if ocr_doc is not None:
+            ocr_doc.close()
 
     return {
         "workspace": str(WORKSPACE_DIR),
@@ -719,6 +805,7 @@ def pdf_read_pages(pdf_path: str, start_page: int = 1, max_pages: int = 10) -> d
         "page_count": total_pages,
         "returned_pages": len(pages),
         "truncated": end_idx < total_pages,
+        "ocr_fallback": ocr_fallback,
         "pages": pages,
     }
 
@@ -731,6 +818,7 @@ def pdf_search_text(
     max_results: int = 200,
     start_page: int = 1,
     max_pages: int = 0,
+    ocr_fallback: bool = True,
 ) -> dict[str, Any]:
     """在 PDF 文本中搜索关键词，返回页码与片段。"""
     if not query or not query.strip():
@@ -755,37 +843,46 @@ def pdf_search_text(
     needle = query if case_sensitive else query.lower()
     matches: list[dict[str, Any]] = []
     truncated = False
-    for page_idx in range(start_idx, end_idx):
-        page = reader.pages[page_idx]
-        text = page.extract_text() or ""
-        haystack = text if case_sensitive else text.lower()
-        from_idx = 0
-        while True:
-            at = haystack.find(needle, from_idx)
-            if at < 0:
-                break
-            snippet_start = max(0, at - 60)
-            snippet_end = min(len(text), at + len(query) + 60)
-            snippet = text[snippet_start:snippet_end]
-            matches.append(
-                {
-                    "page": page_idx + 1,
-                    "offset": at,
-                    "snippet": snippet,
-                }
+    ocr_doc, ocr_engine = _build_ocr_fallback_resources(resolved, ocr_fallback)
+    try:
+        for page_idx in range(start_idx, end_idx):
+            page = reader.pages[page_idx]
+            text, text_source = _extract_page_text_with_fallback(
+                page_idx, page, ocr_fallback, ocr_doc, ocr_engine
             )
-            if len(matches) >= max_results:
-                truncated = True
+            haystack = text if case_sensitive else text.lower()
+            from_idx = 0
+            while True:
+                at = haystack.find(needle, from_idx)
+                if at < 0:
+                    break
+                snippet_start = max(0, at - 60)
+                snippet_end = min(len(text), at + len(query) + 60)
+                snippet = text[snippet_start:snippet_end]
+                matches.append(
+                    {
+                        "page": page_idx + 1,
+                        "offset": at,
+                        "text_source": text_source,
+                        "snippet": snippet,
+                    }
+                )
+                if len(matches) >= max_results:
+                    truncated = True
+                    break
+                from_idx = at + max(1, len(needle))
+            if truncated:
                 break
-            from_idx = at + max(1, len(needle))
-        if truncated:
-            break
+    finally:
+        if ocr_doc is not None:
+            ocr_doc.close()
 
     return {
         "workspace": str(WORKSPACE_DIR),
         "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
         "query": query,
         "case_sensitive": case_sensitive,
+        "ocr_fallback": ocr_fallback,
         "start_page": start_page,
         "end_page": end_idx,
         "searched_pages": max(0, end_idx - start_idx),
@@ -796,7 +893,12 @@ def pdf_search_text(
 
 
 @mcp.tool()
-def pdf_extract_content(pdf_path: str, start_page: int = 1, max_pages: int = 20) -> dict[str, Any]:
+def pdf_extract_content(
+    pdf_path: str,
+    start_page: int = 1,
+    max_pages: int = 20,
+    ocr_fallback: bool = True,
+) -> dict[str, Any]:
     """提取 PDF 内容并输出分页拼接文本。"""
     if start_page <= 0:
         raise ValueError("start_page must be > 0.")
@@ -811,9 +913,18 @@ def pdf_extract_content(pdf_path: str, start_page: int = 1, max_pages: int = 20)
     end_idx = min(start_idx + max_pages, total_pages)
 
     chunks: list[str] = []
-    for page_idx in range(start_idx, end_idx):
-        text = reader.pages[page_idx].extract_text() or ""
-        chunks.append(f"## Page {page_idx + 1}\n\n{text}".rstrip())
+    page_sources: list[dict[str, Any]] = []
+    ocr_doc, ocr_engine = _build_ocr_fallback_resources(resolved, ocr_fallback)
+    try:
+        for page_idx in range(start_idx, end_idx):
+            text, text_source = _extract_page_text_with_fallback(
+                page_idx, reader.pages[page_idx], ocr_fallback, ocr_doc, ocr_engine
+            )
+            chunks.append(f"## Page {page_idx + 1}\n\n{text}".rstrip())
+            page_sources.append({"page": page_idx + 1, "text_source": text_source})
+    finally:
+        if ocr_doc is not None:
+            ocr_doc.close()
     content = "\n\n".join(chunks).strip()
 
     return {
@@ -823,6 +934,8 @@ def pdf_extract_content(pdf_path: str, start_page: int = 1, max_pages: int = 20)
         "end_page": end_idx,
         "page_count": total_pages,
         "truncated": end_idx < total_pages,
+        "ocr_fallback": ocr_fallback,
+        "page_sources": page_sources,
         "content": content,
     }
 
