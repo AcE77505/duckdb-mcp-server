@@ -25,7 +25,7 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SERVER_DIR = Path(__file__).resolve().parent
 _CONFIG_PATH = _SERVER_DIR / "mcp.config.json"
 _DEFAULT_WORKSPACE_DIR = _SERVER_DIR / "workspace"
-# FzBookMaker garbled extraction often emits specific ideographs in U+7280-U+733F.
+# FzBookMaker garbled extraction often emits CJK code points in this range.
 _FZBOOKMAKER_GARBLED_RE = re.compile(r"[\u7280-\u733f]")
 _FZBOOKMAKER_GNAME_RE = re.compile(r"/G[0-9A-F]{2}")
 _FZ_GNAME_TOKEN_CHARS = 4
@@ -164,7 +164,6 @@ def _read_pdf(pdf_path: str) -> tuple[Path, PdfReader]:
 def _looks_like_fzbookmaker_garbled(text: str) -> bool:
     if not text:
         return False
-    text_len = len(text)
     garbled_hits = len(_FZBOOKMAKER_GARBLED_RE.findall(text))
     gname_hits = len(_FZBOOKMAKER_GNAME_RE.findall(text))
     # Conservative thresholds: trigger OCR only on clear signals to reduce false positives.
@@ -173,7 +172,7 @@ def _looks_like_fzbookmaker_garbled(text: str) -> bool:
     if gname_hits >= _FZ_GNAME_MIN_HITS:
         return True
     garbled_coverage_chars = garbled_hits + (gname_hits * _FZ_GNAME_TOKEN_CHARS)
-    if text_len >= _FZ_GARBLED_MIN_TEXT_LEN and garbled_coverage_chars / text_len >= _FZ_GARBLED_MIN_RATIO:
+    if len(text) >= _FZ_GARBLED_MIN_TEXT_LEN and garbled_coverage_chars / len(text) >= _FZ_GARBLED_MIN_RATIO:
         return True
     return False
 
@@ -203,7 +202,6 @@ def _extract_page_text_with_fallback(
 
         lines: list[str] = []
         for item in ocr_result:
-            # RapidOCR returns tuples like: [bbox, text, confidence].
             if len(item) < 2:
                 continue
             line_text = str(item[1]).strip()
