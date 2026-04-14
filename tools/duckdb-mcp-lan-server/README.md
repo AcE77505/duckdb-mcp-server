@@ -122,6 +122,8 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 在工作区中搜索 UTF-8 文本文件内容，返回匹配文件、行号与行内容
 - `workspace_read_text_file(path, start_line=1, max_lines=2000)`
   - 以文本方式读取工作区内 UTF-8 文件，支持按行分页读取
+- `workspace_write_text_file(content, append=false)`
+  - 写入工作区内已存在的 `add.txt`（仅允许该文件；`append=false` 覆盖写入，`append=true` 追加写入）
 - `pdf_get_structure(pdf_path, max_toc_items=2000)`
   - 读取 PDF 的元数据、总页数与目录结构（TOC）
 - `pdf_read_pages(pdf_path, start_page=1, max_pages=10, ocr_fallback=true)`

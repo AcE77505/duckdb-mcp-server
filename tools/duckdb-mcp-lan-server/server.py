@@ -64,6 +64,7 @@ def _resolve_workspace_dir() -> Path:
 
 WORKSPACE_DIR = _resolve_workspace_dir()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+_WORKSPACE_WRITABLE_TEXT_FILE = "add.txt"
 
 
 def _safe_identifier(name: str) -> str:
@@ -709,6 +710,33 @@ def workspace_read_text_file(path: str, start_line: int = 1, max_lines: int = 20
         "total_lines": len(lines),
         "truncated": end_idx < len(lines),
         "content": content,
+    }
+
+
+@mcp.tool()
+def workspace_write_text_file(content: str, append: bool = False) -> dict[str, Any]:
+    """写入工作区内已存在的 add.txt（仅允许该文件）。"""
+    if content is None:
+        raise ValueError("content cannot be null.")
+
+    file_path = _resolve_workspace_path(_WORKSPACE_WRITABLE_TEXT_FILE)
+    if file_path.name != _WORKSPACE_WRITABLE_TEXT_FILE:
+        raise ValueError("Only add.txt is allowed for writing.")
+    if not file_path.exists():
+        raise ValueError(f"File not found: {file_path}")
+    if not file_path.is_file():
+        raise ValueError(f"Path is not a file: {file_path}")
+
+    mode = "a" if append else "w"
+    with file_path.open(mode, encoding="utf-8") as f:
+        f.write(content)
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": file_path.relative_to(WORKSPACE_DIR).as_posix(),
+        "append": append,
+        "bytes_written": len(content.encode("utf-8")),
+        "file_size": int(file_path.stat().st_size),
     }
 
 
