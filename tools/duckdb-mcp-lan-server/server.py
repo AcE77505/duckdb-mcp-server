@@ -7,6 +7,7 @@ from typing import Any
 
 import duckdb
 from mcp.server.fastmcp import FastMCP
+from pypdf import PdfReader
 
 
 mcp = FastMCP("duckdb-mcp-lan-server", json_response=True)
@@ -120,6 +121,24 @@ def _resolve_csv_path(csv_path: str) -> Path:
     if not path.exists() or not path.is_file():
         raise ValueError(f"CSV file not found: {path}")
     return path
+
+
+def _resolve_pdf_path(pdf_path: str) -> Path:
+    path = _resolve_workspace_path(pdf_path)
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"PDF file not found: {path}")
+    if path.suffix.lower() != ".pdf":
+        raise ValueError(f"Not a PDF file: {path}")
+    return path
+
+
+def _read_pdf(pdf_path: str) -> tuple[Path, PdfReader]:
+    resolved = _resolve_pdf_path(pdf_path)
+    try:
+        reader = PdfReader(str(resolved))
+    except Exception as exc:  # pragma: no cover - parser/library errors
+        raise ValueError(f"Failed to read PDF: {resolved}") from exc
+    return resolved, reader
 
 
 def _create_or_replace_view(
@@ -603,6 +622,207 @@ def workspace_read_text_file(path: str, start_line: int = 1, max_lines: int = 20
         "end_line": end_idx,
         "total_lines": len(lines),
         "truncated": end_idx < len(lines),
+        "content": content,
+    }
+
+
+@mcp.tool()
+def pdf_get_structure(pdf_path: str, max_toc_items: int = 2000) -> dict[str, Any]:
+    """读取 PDF 元数据与目录结构（TOC）。"""
+    if max_toc_items <= 0:
+        raise ValueError("max_toc_items must be > 0.")
+    if max_toc_items > 20000:
+        raise ValueError("max_toc_items must be <= 20000.")
+
+    resolved, reader = _read_pdf(pdf_path)
+    metadata_raw = reader.metadata or {}
+    metadata: dict[str, Any] = {}
+    if isinstance(metadata_raw, dict):
+        for k, v in metadata_raw.items():
+            key = str(k).lstrip("/")
+            metadata[key] = str(v) if v is not None else None
+
+    items: list[dict[str, Any]] = []
+
+    def walk_outline(nodes: list[Any], depth: int) -> None:
+        for node in nodes:
+            if len(items) >= max_toc_items:
+                return
+            if isinstance(node, list):
+                walk_outline(node, depth + 1)
+                continue
+
+            title = str(getattr(node, "title", "")).strip()
+            page_number: int | None = None
+            try:
+                page_number = int(reader.get_destination_page_number(node) + 1)
+            except Exception:
+                page_number = None
+            items.append({"title": title, "page": page_number, "depth": depth})
+
+    try:
+        outline = reader.outline
+        if isinstance(outline, list):
+            walk_outline(outline, 1)
+    except Exception:
+        items = []
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "page_count": len(reader.pages),
+        "metadata": metadata,
+        "toc_count": len(items),
+        "toc_truncated": len(items) >= max_toc_items,
+        "toc": items,
+    }
+
+
+@mcp.tool()
+def pdf_read_pages(pdf_path: str, start_page: int = 1, max_pages: int = 10) -> dict[str, Any]:
+    """按页读取 PDF 文本内容，并返回每页文本与图像数量统计。"""
+    if start_page <= 0:
+        raise ValueError("start_page must be > 0.")
+    if max_pages <= 0:
+        raise ValueError("max_pages must be > 0.")
+    if max_pages > 200:
+        raise ValueError("max_pages must be <= 200.")
+
+    resolved, reader = _read_pdf(pdf_path)
+    total_pages = len(reader.pages)
+    start_idx = start_page - 1
+    end_idx = min(start_idx + max_pages, total_pages)
+
+    pages: list[dict[str, Any]] = []
+    for page_idx in range(start_idx, end_idx):
+        page = reader.pages[page_idx]
+        text = page.extract_text() or ""
+        image_count = 0
+        try:
+            image_count = len(list(page.images))
+        except Exception:
+            image_count = 0
+        pages.append(
+            {
+                "page": page_idx + 1,
+                "char_count": len(text),
+                "image_count": int(image_count),
+                "text": text,
+            }
+        )
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "start_page": start_page,
+        "end_page": end_idx,
+        "page_count": total_pages,
+        "returned_pages": len(pages),
+        "truncated": end_idx < total_pages,
+        "pages": pages,
+    }
+
+
+@mcp.tool()
+def pdf_search_text(
+    pdf_path: str,
+    query: str,
+    case_sensitive: bool = False,
+    max_results: int = 200,
+    start_page: int = 1,
+    max_pages: int = 0,
+) -> dict[str, Any]:
+    """在 PDF 文本中搜索关键词，返回页码与片段。"""
+    if not query or not query.strip():
+        raise ValueError("query cannot be empty.")
+    if max_results <= 0:
+        raise ValueError("max_results must be > 0.")
+    if max_results > 5000:
+        raise ValueError("max_results must be <= 5000.")
+    if start_page <= 0:
+        raise ValueError("start_page must be > 0.")
+    if max_pages < 0:
+        raise ValueError("max_pages must be >= 0.")
+
+    resolved, reader = _read_pdf(pdf_path)
+    total_pages = len(reader.pages)
+    start_idx = start_page - 1
+    if max_pages == 0:
+        end_idx = total_pages
+    else:
+        end_idx = min(start_idx + max_pages, total_pages)
+
+    needle = query if case_sensitive else query.lower()
+    matches: list[dict[str, Any]] = []
+    truncated = False
+    for page_idx in range(start_idx, end_idx):
+        page = reader.pages[page_idx]
+        text = page.extract_text() or ""
+        haystack = text if case_sensitive else text.lower()
+        from_idx = 0
+        while True:
+            at = haystack.find(needle, from_idx)
+            if at < 0:
+                break
+            snippet_start = max(0, at - 60)
+            snippet_end = min(len(text), at + len(query) + 60)
+            snippet = text[snippet_start:snippet_end]
+            matches.append(
+                {
+                    "page": page_idx + 1,
+                    "offset": at,
+                    "snippet": snippet,
+                }
+            )
+            if len(matches) >= max_results:
+                truncated = True
+                break
+            from_idx = at + max(1, len(needle))
+        if truncated:
+            break
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "query": query,
+        "case_sensitive": case_sensitive,
+        "start_page": start_page,
+        "end_page": end_idx,
+        "searched_pages": max(0, end_idx - start_idx),
+        "returned": len(matches),
+        "truncated": truncated,
+        "matches": matches,
+    }
+
+
+@mcp.tool()
+def pdf_extract_content(pdf_path: str, start_page: int = 1, max_pages: int = 20) -> dict[str, Any]:
+    """提取 PDF 内容并输出分页拼接文本。"""
+    if start_page <= 0:
+        raise ValueError("start_page must be > 0.")
+    if max_pages <= 0:
+        raise ValueError("max_pages must be > 0.")
+    if max_pages > 500:
+        raise ValueError("max_pages must be <= 500.")
+
+    resolved, reader = _read_pdf(pdf_path)
+    total_pages = len(reader.pages)
+    start_idx = start_page - 1
+    end_idx = min(start_idx + max_pages, total_pages)
+
+    chunks: list[str] = []
+    for page_idx in range(start_idx, end_idx):
+        text = reader.pages[page_idx].extract_text() or ""
+        chunks.append(f"## Page {page_idx + 1}\n\n{text}".rstrip())
+    content = "\n\n".join(chunks).strip()
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "start_page": start_page,
+        "end_page": end_idx,
+        "page_count": total_pages,
+        "truncated": end_idx < total_pages,
         "content": content,
     }
 

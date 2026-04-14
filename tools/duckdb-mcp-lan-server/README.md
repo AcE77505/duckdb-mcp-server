@@ -122,6 +122,14 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 在工作区中搜索 UTF-8 文本文件内容，返回匹配文件、行号与行内容
 - `workspace_read_text_file(path, start_line=1, max_lines=2000)`
   - 以文本方式读取工作区内 UTF-8 文件，支持按行分页读取
+- `pdf_get_structure(pdf_path, max_toc_items=2000)`
+  - 读取 PDF 的元数据、总页数与目录结构（TOC）
+- `pdf_read_pages(pdf_path, start_page=1, max_pages=10)`
+  - 按页读取 PDF 文本，并返回每页文本长度与图像数量
+- `pdf_search_text(pdf_path, query, case_sensitive=false, max_results=200, start_page=1, max_pages=0)`
+  - 在 PDF 文本中搜索关键词，返回页码、偏移量和上下文片段
+- `pdf_extract_content(pdf_path, start_page=1, max_pages=20)`
+  - 批量提取 PDF 文本内容并按页拼接，适合学术文献阅读与后续处理
 
 ## 常见使用建议（针对约 26MB / 12.4 万行数据）
 
