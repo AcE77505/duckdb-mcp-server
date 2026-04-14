@@ -749,7 +749,7 @@ def workspace_replace_text_in_line(
 ) -> dict[str, Any]:
     """在 add.txt 指定行内替换文本片段。"""
     if line_number <= 0:
-        raise ValueError("line_number must be > 0.")
+        raise ValueError("line_number must be a positive integer.")
     if old_text == "":
         raise ValueError("old_text cannot be empty.")
 
