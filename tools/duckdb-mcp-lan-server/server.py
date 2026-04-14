@@ -25,8 +25,15 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SERVER_DIR = Path(__file__).resolve().parent
 _CONFIG_PATH = _SERVER_DIR / "mcp.config.json"
 _DEFAULT_WORKSPACE_DIR = _SERVER_DIR / "workspace"
+# FzBookMaker 常见乱码会落在该 CJK 范围（如 犐狀犳狅...）。
 _FZBOOKMAKER_GARBLED_RE = re.compile(r"[\u7280-\u733f]")
 _FZBOOKMAKER_GNAME_RE = re.compile(r"/G[0-9A-F]{2}")
+_FZ_GARBLED_MIN_HITS = 8
+_FZ_GNAME_MIN_HITS = 5
+_FZ_GARBLED_MIN_TEXT_LEN = 120
+_FZ_GARBLED_MIN_RATIO = 0.05
+_PDF_OCR_RENDER_SCALE = 2
+_PDF_SEARCH_SNIPPET_CONTEXT_CHARS = 60
 
 
 def _load_mcp_config() -> dict[str, Any]:
@@ -158,11 +165,12 @@ def _looks_like_fzbookmaker_garbled(text: str) -> bool:
         return False
     garbled_hits = len(_FZBOOKMAKER_GARBLED_RE.findall(text))
     gname_hits = len(_FZBOOKMAKER_GNAME_RE.findall(text))
-    if garbled_hits >= 8:
+    # 阈值采用保守策略：明显命中时才触发 OCR，避免正常文档误判。
+    if garbled_hits >= _FZ_GARBLED_MIN_HITS:
         return True
-    if gname_hits >= 5:
+    if gname_hits >= _FZ_GNAME_MIN_HITS:
         return True
-    if len(text) >= 120 and (garbled_hits + gname_hits) / len(text) >= 0.05:
+    if len(text) >= _FZ_GARBLED_MIN_TEXT_LEN and (garbled_hits + gname_hits) / len(text) >= _FZ_GARBLED_MIN_RATIO:
         return True
     return False
 
@@ -181,7 +189,10 @@ def _extract_page_text_with_fallback(
         return text, "text-layer"
 
     try:
-        pix = ocr_doc[page_index].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        # 2x 放大后 OCR 准确率更稳定，同时保持可接受的性能开销。
+        pix = ocr_doc[page_index].get_pixmap(
+            matrix=fitz.Matrix(_PDF_OCR_RENDER_SCALE, _PDF_OCR_RENDER_SCALE), alpha=False
+        )
         image_bytes = pix.tobytes("png")
         ocr_result, _ = ocr_engine(image_bytes)
         if not ocr_result:
@@ -856,8 +867,10 @@ def pdf_search_text(
                 at = haystack.find(needle, from_idx)
                 if at < 0:
                     break
-                snippet_start = max(0, at - 60)
-                snippet_end = min(len(text), at + len(query) + 60)
+                snippet_start = max(0, at - _PDF_SEARCH_SNIPPET_CONTEXT_CHARS)
+                snippet_end = min(
+                    len(text), at + len(query) + _PDF_SEARCH_SNIPPET_CONTEXT_CHARS
+                )
                 snippet = text[snippet_start:snippet_end]
                 matches.append(
                     {
