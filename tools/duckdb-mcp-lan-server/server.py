@@ -25,7 +25,7 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SERVER_DIR = Path(__file__).resolve().parent
 _CONFIG_PATH = _SERVER_DIR / "mcp.config.json"
 _DEFAULT_WORKSPACE_DIR = _SERVER_DIR / "workspace"
-# FzBookMaker 常见乱码会落在该 CJK 范围（如 犐狀犳狅...）。
+# FzBookMaker garbled extraction often lands in this CJK range (e.g. 犐狀犳狅...).
 _FZBOOKMAKER_GARBLED_RE = re.compile(r"[\u7280-\u733f]")
 _FZBOOKMAKER_GNAME_RE = re.compile(r"/G[0-9A-F]{2}")
 _FZ_GARBLED_MIN_HITS = 8
@@ -165,7 +165,7 @@ def _looks_like_fzbookmaker_garbled(text: str) -> bool:
         return False
     garbled_hits = len(_FZBOOKMAKER_GARBLED_RE.findall(text))
     gname_hits = len(_FZBOOKMAKER_GNAME_RE.findall(text))
-    # 阈值采用保守策略：明显命中时才触发 OCR，避免正常文档误判。
+    # Conservative thresholds: trigger OCR only on clear signals to reduce false positives.
     if garbled_hits >= _FZ_GARBLED_MIN_HITS:
         return True
     if gname_hits >= _FZ_GNAME_MIN_HITS:
@@ -189,7 +189,7 @@ def _extract_page_text_with_fallback(
         return text, "text-layer"
 
     try:
-        # 2x 放大后 OCR 准确率更稳定，同时保持可接受的性能开销。
+        # Render at 2x to improve OCR accuracy while keeping runtime acceptable.
         pix = ocr_doc[page_index].get_pixmap(
             matrix=fitz.Matrix(_PDF_OCR_RENDER_SCALE, _PDF_OCR_RENDER_SCALE), alpha=False
         )
