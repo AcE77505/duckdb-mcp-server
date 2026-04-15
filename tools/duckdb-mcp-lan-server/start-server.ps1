@@ -63,8 +63,20 @@ if (Test-Path $requirementsHashPath) {
 function Test-RequiredModules {
     param([string]$PythonExe)
 
-    & $PythonExe -c "import duckdb, matplotlib, scipy, mcp, pypdf"
-    return ($LASTEXITCODE -eq 0)
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = & $PythonExe -c "import duckdb, matplotlib, scipy, mcp, pypdf" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            if ($output) {
+                Write-Warning ("Dependency import check failed: " + ($output -join [Environment]::NewLine))
+            }
+            return $false
+        }
+        return $true
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
 }
 
 $needsInstall = $false
