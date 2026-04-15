@@ -102,6 +102,8 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 对 CSV 执行 SQL（SQL 中使用 `table_name` 作为表名，`max_rows` 上限 10000）
 - `deduplicate_csv(csv_path, key_columns, output_path=None, table_name="tracks", order_by=None, ignore_errors=False)`
   - 按 key 列去重，输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.dedup.csv`）
+- `filter_csv(csv_path, where_sql, output_path=None, table_name="tracks", ignore_errors=False)`
+  - 按过滤条件输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.filtered.csv`），并返回过滤前后与剔除行数统计
 - `duckdb_health()`
   - 返回 `{ ok, duckdbVersion, dbPath, time }`，用于连通性检测（`time` 为 ISO8601）
 - `duckdb_list_tables(includeViews=true)`

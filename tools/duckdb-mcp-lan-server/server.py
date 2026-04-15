@@ -322,6 +322,23 @@ def _validate_query_sql(sql: str) -> str:
     return normalized
 
 
+def _validate_where_sql(where_sql: str) -> str:
+    normalized = where_sql.strip()
+    if not normalized:
+        raise ValueError("where_sql cannot be empty.")
+    if ";" in normalized:
+        raise ValueError("where_sql must be a single expression without semicolons.")
+    if "--" in normalized or "/*" in normalized or "*/" in normalized:
+        raise ValueError("where_sql cannot contain SQL comments.")
+    if re.search(
+        r"\b(select|with|copy|create|insert|update|delete|drop|alter|attach|detach|pragma)\b",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        raise ValueError("where_sql must be a filter expression only.")
+    return normalized
+
+
 @mcp.tool()
 def describe_csv(csv_path: str, table_name: str = "tracks", ignore_errors: bool = False) -> dict[str, Any]:
     """读取 CSV 并返回自动推断的字段信息与总行数。"""
@@ -439,6 +456,58 @@ def deduplicate_csv(
             "rows_after": int(after),
             "removed_rows": int(before - after),
         }
+
+
+@mcp.tool()
+def filter_csv(
+    csv_path: str,
+    where_sql: str,
+    output_path: str | None = None,
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """按过滤条件剔除异常数据并输出新 CSV。"""
+    source = _resolve_csv_path(csv_path)
+    target = (
+        _resolve_output_path(str(source), output_path)
+        if output_path
+        else source.with_name(f"{source.stem}.filtered.csv")
+    )
+    safe_where = _validate_where_sql(where_sql)
+
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(source), ignore_errors)
+        before = con.execute(f'SELECT COUNT(*) FROM "{safe_table}"').fetchone()[0]
+
+        target_literal = _sql_string_literal(str(target))
+        ignore_errors_literal = "true" if ignore_errors else "false"
+        con.execute(
+            f"""
+            COPY (
+                SELECT *
+                FROM "{safe_table}"
+                WHERE {safe_where}
+            )
+            TO {target_literal}
+            WITH (FORMAT CSV, HEADER true)
+            """
+        )
+        after = con.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM read_csv_auto({target_literal}, sample_size=-1, ignore_errors={ignore_errors_literal})
+            """
+        ).fetchone()[0]
+
+    return {
+        "table_name": safe_table,
+        "source_csv": str(source),
+        "output_csv": str(target),
+        "where_sql": safe_where,
+        "rows_before": int(before),
+        "rows_after": int(after),
+        "removed_rows": int(before - after),
+    }
 
 
 @mcp.tool()
