@@ -66,11 +66,41 @@ function Test-RequiredModules {
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $output = & $PythonExe -c "import duckdb, matplotlib, scipy, mcp, pypdf" 2>&1
+        $checkScript = @"
+import importlib
+import json
+
+required_modules = ["duckdb", "matplotlib", "scipy", "mcp", "pypdf"]
+missing = []
+for module_name in required_modules:
+    try:
+        importlib.import_module(module_name)
+    except Exception as ex:
+        missing.append(module_name)
+
+print(json.dumps({"ok": len(missing) == 0, "missing": missing}))
+if missing:
+    raise SystemExit(1)
+"@
+        $output = & $PythonExe -c $checkScript 2>&1
+        $resultText = ($output | Out-String).Trim()
+        if (-not $resultText) {
+            Write-Warning "Dependency import check failed: no output from Python."
+            return $false
+        }
+        try {
+            $result = $resultText | ConvertFrom-Json
+        } catch {
+            Write-Warning "Dependency import check failed."
+            return $false
+        }
+        if (-not $result.ok) {
+            $missingModules = @($result.missing) -join ", "
+            Write-Warning "Dependency import check failed. Missing modules: $missingModules"
+            return $false
+        }
         if ($LASTEXITCODE -ne 0) {
-            if ($output) {
-                Write-Warning ("Dependency import check failed: " + ($output -join [Environment]::NewLine))
-            }
+            Write-Warning "Dependency import check failed."
             return $false
         }
         return $true
