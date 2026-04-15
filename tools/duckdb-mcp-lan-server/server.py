@@ -497,7 +497,7 @@ def filter_csv(
     table_name: str = "tracks",
     ignore_errors: bool = False,
 ) -> dict[str, Any]:
-    """按过滤条件剔除异常数据并输出新 CSV。"""
+    """Filter CSV rows by condition and export a new CSV file."""
     source = _resolve_csv_path(csv_path)
     target = (
         _resolve_output_path(str(source), output_path)
