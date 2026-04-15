@@ -60,7 +60,22 @@ if (Test-Path $requirementsHashPath) {
     $installedHash = (Get-Content -Path $requirementsHashPath -Raw).Trim()
 }
 
+function Test-RequiredModules {
+    param([string]$PythonExe)
+
+    & $PythonExe -c "import duckdb, matplotlib, scipy, mcp, pypdf"
+    return ($LASTEXITCODE -eq 0)
+}
+
+$needsInstall = $false
 if ($requirementsHash -ne $installedHash) {
+    $needsInstall = $true
+} elseif (-not (Test-RequiredModules -PythonExe $venvPython)) {
+    Write-Host "Detected missing/broken dependencies in virtual environment. Reinstalling..."
+    $needsInstall = $true
+}
+
+if ($needsInstall) {
     Write-Host "Installing dependencies from requirements.txt..."
     & $venvPython -m pip install -r $requirementsPath
     Set-Content -Path $requirementsHashPath -Value $requirementsHash -Encoding UTF8
