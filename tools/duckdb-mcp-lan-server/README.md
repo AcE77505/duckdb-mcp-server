@@ -104,6 +104,18 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 按 key 列去重，输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.dedup.csv`）
 - `filter_csv(csv_path, where_sql, output_path=None, table_name="tracks", ignore_errors=False)`
   - 按过滤条件输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.filtered.csv`），并返回过滤前后与剔除行数统计
+- `plot_basic(csv_path, chart_type, x_field=None, y_field=None, color_field=None, output_path="plot_basic.png", bins=20, table_name="tracks", ignore_errors=False)`
+  - 生成基础图表：`scatter`、`line`、`histogram`、`box`
+- `plot_time_series(csv_path, time_field, value_fields, output_path, table_name="tracks", ignore_errors=False)`
+  - 绘制时间序列图，支持一个或多个数值字段
+- `plot_geo(csv_path, x_field, y_field, output_path, color_field=None, size_field=None, table_name="tracks", ignore_errors=False)`
+  - 绘制地理散点图，支持颜色字段与点大小字段
+- `analyze_correlation(csv_path, field_x, field_y, method="pearson", table_name="tracks", ignore_errors=False)`
+  - 计算相关系数、p 值和样本数（支持 `pearson` 与 `spearman`）
+- `analyze_distribution(csv_path, field, table_name="tracks", ignore_errors=False)`
+  - 返回分布统计（最小值、最大值、均值、中位数、标准差、四分位数等）
+- `analyze_group_stats(csv_path, group_field, value_fields, stats=None, table_name="tracks", ignore_errors=False)`
+  - 按分组字段输出多字段统计结果（支持 `mean/std/count/min/max/sum/median`）
 - `duckdb_health()`
   - 返回 `{ ok, duckdbVersion, dbPath, time }`，用于连通性检测（`time` 为 ISO8601）
 - `duckdb_list_tables(includeViews=true)`
