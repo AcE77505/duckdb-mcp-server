@@ -120,6 +120,9 @@ if ($requirementsHash -ne $installedHash) {
 if ($needsInstall) {
     Write-Host "Installing dependencies from requirements.txt..."
     & $venvPython -m pip install -r $requirementsPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Dependency installation failed. Please resolve the pip errors above and retry."
+    }
     Set-Content -Path $requirementsHashPath -Value $requirementsHash -Encoding UTF8
 } else {
     Write-Host "Dependencies are up to date. Skipping install."

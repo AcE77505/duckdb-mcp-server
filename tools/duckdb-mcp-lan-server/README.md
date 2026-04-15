@@ -17,6 +17,8 @@ cd tools/duckdb-mcp-lan-server
 - 后续启动会复用 `.venv`，仅当 `requirements.txt` 变化时才重新安装依赖
 - 若检测到 `.venv` 里关键依赖缺失/损坏（即使 `requirements.txt` 未变化），脚本也会自动重新安装依赖
 - 依赖检查失败时会提示缺失模块摘要，避免输出冗长 traceback
+- Python 3.13+ 下会跳过 `rapidocr-onnxruntime` 安装（OCR 回退能力不可用，但服务可正常启动）
+- 若 `pip install -r requirements.txt` 失败，脚本会立即退出，不会继续启动服务
 - 脚本默认设置 `ENABLE_DNS_REBINDING_PROTECTION=0`
 - 可选参数示例：`.\start-server.ps1 -Port 8000 -BindHost 0.0.0.0 -EnableDnsRebindingProtection 0`
 
