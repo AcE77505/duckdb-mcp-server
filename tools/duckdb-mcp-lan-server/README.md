@@ -108,8 +108,12 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 按 key 列去重，输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.dedup.csv`）
 - `filter_csv(csv_path, where_sql, output_path=None, table_name="tracks", ignore_errors=False)`
   - 按过滤条件输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.filtered.csv`），并返回过滤前后与剔除行数统计
+- `extract_columns_to_csv(csv_path, output_path, columns, where_sql="", order_by="", table_name="tracks", ignore_errors=False)`
+  - 从 CSV 提取指定字段并导出新 CSV，支持可选过滤与排序（如按 `fnum, u_time` 排序）
 - `plot_basic(csv_path, chart_type, x_field=None, y_field=None, color_field=None, output_path="plot_basic.png", bins=20, table_name="tracks", ignore_errors=False)`
   - 生成基础图表：`scatter`、`line`、`histogram`、`box`
+- `plot_categorical_scatter(csv_path, x_field, y_field, category_field, output_path="categorical_scatter.png", dpi=1200, figsize=[12, 10], colormap="tab10", point_size=1.0, alpha=0.6, title="Categorical Scatter Plot", x_label=None, y_label=None, table_name="tracks", ignore_errors=False)`
+  - 绘制分类散点图：使用离散调色板 + 图例（非连续色带），支持高分辨率 `dpi`
 - `plot_time_series(csv_path, time_field, value_fields, output_path, table_name="tracks", ignore_errors=False)`
   - 绘制时间序列图，支持一个或多个数值字段
 - `plot_geo(csv_path, x_field, y_field, output_path, color_field=None, size_field=None, table_name="tracks", ignore_errors=False)`

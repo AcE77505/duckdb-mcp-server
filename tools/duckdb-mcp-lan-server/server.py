@@ -690,6 +690,180 @@ def plot_basic(
 
 
 @mcp.tool()
+def extract_columns_to_csv(
+    csv_path: str,
+    output_path: str,
+    columns: list[str],
+    where_sql: str = "",
+    order_by: str = "",
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """Extract selected columns from a CSV file into a new CSV file."""
+    safe_columns = [c.strip() for c in columns if c and c.strip()]
+    if not safe_columns:
+        raise ValueError("columns cannot be empty.")
+
+    csv_file = _resolve_csv_path(csv_path)
+    target = _resolve_output_file_path(output_path, default_ext=".csv")
+    target_literal = _sql_string_literal(str(target))
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        available_columns = _list_columns(con, safe_table)
+        _require_columns(available_columns, safe_columns)
+
+        select_expr = ", ".join(_quote_identifier(c) for c in safe_columns)
+        where_clause = ""
+        if where_sql.strip():
+            where_clause = f"WHERE {where_sql.strip()}"
+        order_clause = ""
+        if order_by.strip():
+            order_expr = _safe_order_by(order_by, available_columns, "")
+            order_clause = f"ORDER BY {order_expr}"
+
+        con.execute(
+            f"""
+            COPY (
+                SELECT {select_expr}
+                FROM "{safe_table}"
+                {where_clause}
+                {order_clause}
+            )
+            TO {target_literal}
+            WITH (FORMAT CSV, HEADER true)
+            """
+        )
+        row_count = con.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM read_csv_auto({target_literal}, sample_size=-1, ignore_errors=false)
+            """
+        ).fetchone()[0]
+
+    return {
+        "source_csv": str(csv_file),
+        "output_csv": str(target),
+        "columns": safe_columns,
+        "where_sql": where_sql.strip() or None,
+        "order_by": order_by.strip() or None,
+        "row_count": int(row_count),
+    }
+
+
+@mcp.tool()
+def plot_categorical_scatter(
+    csv_path: str,
+    x_field: str,
+    y_field: str,
+    category_field: str,
+    output_path: str = "categorical_scatter.png",
+    dpi: int = 1200,
+    figsize: list[float] | None = None,
+    colormap: str = "tab10",
+    point_size: float = 1.0,
+    alpha: float = 0.6,
+    title: str = "Categorical Scatter Plot",
+    x_label: str | None = None,
+    y_label: str | None = None,
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """Plot categorical scatter points with a discrete colormap and legend."""
+    if dpi <= 0:
+        raise ValueError("dpi must be > 0.")
+    if point_size <= 0:
+        raise ValueError("point_size must be > 0.")
+    if not (0 <= alpha <= 1):
+        raise ValueError("alpha must be between 0 and 1.")
+
+    raw_figsize = figsize or [12.0, 10.0]
+    if len(raw_figsize) != 2:
+        raise ValueError("figsize must contain exactly 2 numbers: [width, height].")
+    fig_w = _to_float(raw_figsize[0])
+    fig_h = _to_float(raw_figsize[1])
+    if fig_w is None or fig_h is None or fig_w <= 0 or fig_h <= 0:
+        raise ValueError("figsize values must be positive numbers.")
+
+    csv_file = _resolve_csv_path(csv_path)
+    target = _resolve_output_file_path(output_path, default_ext=".png")
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        columns = _list_columns(con, safe_table)
+        _require_columns(columns, [x_field, y_field, category_field])
+
+        x_id = _quote_identifier(x_field)
+        y_id = _quote_identifier(y_field)
+        category_id = _quote_identifier(category_field)
+        rows = con.execute(
+            f"""
+            SELECT {x_id}, {y_id}, {category_id}
+            FROM "{safe_table}"
+            WHERE {x_id} IS NOT NULL
+              AND {y_id} IS NOT NULL
+              AND {category_id} IS NOT NULL
+            """
+        ).fetchall()
+        if not rows:
+            raise ValueError("No rows available for plotting after NULL filtering.")
+
+        grouped: dict[str, list[tuple[float, float]]] = {}
+        for x_val, y_val, category_val in rows:
+            x_num = _to_float(x_val)
+            y_num = _to_float(y_val)
+            if x_num is None or y_num is None:
+                continue
+            key = str(category_val)
+            grouped.setdefault(key, []).append((x_num, y_num))
+        if not grouped:
+            raise ValueError("No numeric rows available for plotting.")
+
+        categories = sorted(grouped.keys())
+        cmap = plt.get_cmap(colormap, max(1, len(categories)))
+        fig, ax = plt.subplots(figsize=(float(fig_w), float(fig_h)))
+        try:
+            for idx, category in enumerate(categories):
+                points = grouped[category]
+                xs = [p[0] for p in points]
+                ys = [p[1] for p in points]
+                ax.scatter(
+                    xs,
+                    ys,
+                    s=float(point_size),
+                    alpha=float(alpha),
+                    color=[cmap(idx)],
+                    label=category,
+                )
+
+            ax.set_xlabel((x_label or x_field).strip())
+            ax.set_ylabel((y_label or y_field).strip())
+            ax.set_title(title.strip() or "Categorical Scatter Plot")
+            ax.legend(
+                title=category_field,
+                loc="best",
+                fontsize=8,
+                markerscale=3,
+                frameon=True,
+            )
+            fig.tight_layout()
+            fig.savefig(str(target), dpi=int(dpi))
+        finally:
+            plt.close(fig)
+
+    return {
+        "csv_path": str(csv_file),
+        "output_path": str(target),
+        "x_field": x_field,
+        "y_field": y_field,
+        "category_field": category_field,
+        "category_count": len(categories),
+        "point_count": sum(len(points) for points in grouped.values()),
+        "dpi": int(dpi),
+        "figsize": [float(fig_w), float(fig_h)],
+        "colormap": colormap,
+    }
+
+
+@mcp.tool()
 def plot_time_series(
     csv_path: str,
     time_field: str,
