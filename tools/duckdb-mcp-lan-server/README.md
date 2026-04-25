@@ -15,6 +15,10 @@ cd tools/duckdb-mcp-lan-server
 
 - 首次运行会自动创建 `.venv` 并安装依赖
 - 后续启动会复用 `.venv`，仅当 `requirements.txt` 变化时才重新安装依赖
+- 若检测到 `.venv` 里关键依赖缺失/损坏（即使 `requirements.txt` 未变化），脚本也会自动重新安装依赖
+- 依赖检查失败时会提示缺失模块摘要，避免输出冗长 traceback
+- Python 3.13+ 下会跳过 `rapidocr-onnxruntime` 安装（OCR 回退能力不可用，但服务可正常启动）
+- 若 `pip install -r requirements.txt` 失败，脚本会立即退出，不会继续启动服务
 - 脚本默认设置 `ENABLE_DNS_REBINDING_PROTECTION=0`
 - 可选参数示例：`.\start-server.ps1 -Port 8000 -BindHost 0.0.0.0 -EnableDnsRebindingProtection 0`
 
@@ -102,6 +106,24 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 对 CSV 执行 SQL（SQL 中使用 `table_name` 作为表名，`max_rows` 上限 10000）
 - `deduplicate_csv(csv_path, key_columns, output_path=None, table_name="tracks", order_by=None, ignore_errors=False)`
   - 按 key 列去重，输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.dedup.csv`）
+- `filter_csv(csv_path, where_sql, output_path=None, table_name="tracks", ignore_errors=False)`
+  - 按过滤条件输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.filtered.csv`），并返回过滤前后与剔除行数统计
+- `extract_columns_to_csv(csv_path, output_path, columns, where_sql="", order_by="", table_name="tracks", ignore_errors=False)`
+  - 从 CSV 提取指定字段并导出新 CSV，支持可选过滤与排序（如按 `fnum, u_time` 排序）
+- `plot_basic(csv_path, chart_type, x_field=None, y_field=None, color_field=None, output_path="plot_basic.png", bins=20, table_name="tracks", ignore_errors=False)`
+  - 生成基础图表：`scatter`、`line`、`histogram`、`box`
+- `plot_categorical_scatter(csv_path, x_field, y_field, category_field, output_path="categorical_scatter.png", dpi=1200, figsize=[12, 10], colormap="tab10", point_size=1.0, alpha=0.6, title="Categorical Scatter Plot", x_label=None, y_label=None, table_name="tracks", ignore_errors=False)`
+  - 绘制分类散点图：使用离散调色板 + 图例（非连续色带），支持高分辨率 `dpi`
+- `plot_time_series(csv_path, time_field, value_fields, output_path, table_name="tracks", ignore_errors=False)`
+  - 绘制时间序列图，支持一个或多个数值字段
+- `plot_geo(csv_path, x_field, y_field, output_path, color_field=None, size_field=None, table_name="tracks", ignore_errors=False)`
+  - 绘制地理散点图，支持颜色字段与点大小字段
+- `analyze_correlation(csv_path, field_x, field_y, method="pearson", table_name="tracks", ignore_errors=False)`
+  - 计算相关系数、p 值和样本数（支持 `pearson` 与 `spearman`）
+- `analyze_distribution(csv_path, field, table_name="tracks", ignore_errors=False)`
+  - 返回分布统计（最小值、最大值、均值、中位数、标准差、四分位数等）
+- `analyze_group_stats(csv_path, group_field, value_fields, stats=None, table_name="tracks", ignore_errors=False)`
+  - 按分组字段输出多字段统计结果（支持 `mean/std/count/min/max/sum/median`）
 - `duckdb_health()`
   - 返回 `{ ok, duckdbVersion, dbPath, time }`，用于连通性检测（`time` 为 ISO8601）
 - `duckdb_list_tables(includeViews=true)`
@@ -122,6 +144,10 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 在工作区中搜索 UTF-8 文本文件内容，返回匹配文件、行号与行内容
 - `workspace_read_text_file(path, start_line=1, max_lines=2000)`
   - 以文本方式读取工作区内 UTF-8 文件，支持按行分页读取
+- `workspace_write_text_file(content, append=false)`
+  - 写入工作区内已存在的 `add.txt`（仅允许该文件；`append=false` 覆盖写入，`append=true` 追加写入）
+- `workspace_replace_text_in_line(line_number, old_text, new_text, replace_all=false)`
+  - 仅在 `add.txt` 的指定行内替换文本片段；`replace_all=false` 仅替换首个匹配，`true` 替换该行全部匹配
 - `pdf_get_structure(pdf_path, max_toc_items=2000)`
   - 读取 PDF 的元数据、总页数与目录结构（TOC）
 - `pdf_read_pages(pdf_path, start_page=1, max_pages=10, ocr_fallback=true)`

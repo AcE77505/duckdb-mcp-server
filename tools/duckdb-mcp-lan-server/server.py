@@ -6,8 +6,13 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import matplotlib
 from mcp.server.fastmcp import FastMCP
 from pypdf import PdfReader
+from scipy import stats as scipy_stats
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 try:
     import fitz  # type: ignore[import-not-found]
@@ -64,6 +69,7 @@ def _resolve_workspace_dir() -> Path:
 
 WORKSPACE_DIR = _resolve_workspace_dir()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+_WORKSPACE_WRITABLE_TEXT_FILE = "add.txt"
 
 
 def _safe_identifier(name: str) -> str:
@@ -119,6 +125,15 @@ def _read_utf8_text(path: Path) -> str:
         raise ValueError(f"File is not valid UTF-8 text: {path}") from exc
 
 
+def _resolve_writable_workspace_text_file() -> Path:
+    file_path = _resolve_workspace_path(_WORKSPACE_WRITABLE_TEXT_FILE)
+    if not file_path.exists():
+        raise ValueError(f"File not found: {file_path}")
+    if not file_path.is_file():
+        raise ValueError(f"Path is not a file: {file_path}")
+    return file_path
+
+
 def _sql_string_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -131,6 +146,17 @@ def _resolve_output_path(csv_path: str, output_path: str | None) -> Path:
             path = WORKSPACE_DIR / path
         return path.resolve()
     return source.with_name(f"{source.stem}.dedup.csv")
+
+
+def _resolve_output_file_path(output_path: str, default_ext: str = ".png") -> Path:
+    path = Path(output_path).expanduser()
+    if not path.is_absolute():
+        path = WORKSPACE_DIR / path
+    resolved = path.resolve()
+    if not resolved.suffix:
+        resolved = resolved.with_suffix(default_ext)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    return resolved
 
 
 def _resolve_csv_path(csv_path: str) -> Path:
@@ -249,6 +275,21 @@ def _list_columns(con: duckdb.DuckDBPyConnection, table_name: str) -> set[str]:
     return {r[0] for r in rows}
 
 
+def _require_columns(available_columns: set[str], required_columns: list[str]) -> None:
+    missing = [name for name in required_columns if name not in available_columns]
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
 def _safe_order_by(order_by: str | None, allowed_columns: set[str], fallback_expr: str) -> str:
     if not order_by:
         return fallback_expr
@@ -309,6 +350,23 @@ def _validate_query_sql(sql: str) -> str:
         raise ValueError("Only SELECT / WITH queries are allowed.")
     if "with recursive" in lowered:
         raise ValueError("WITH RECURSIVE is not allowed.")
+    return normalized
+
+
+def _validate_where_sql(where_sql: str) -> str:
+    normalized = where_sql.strip()
+    if not normalized:
+        raise ValueError("where_sql cannot be empty.")
+    if ";" in normalized:
+        raise ValueError("where_sql must be a single expression without semicolons.")
+    if "--" in normalized or "/*" in normalized or "*/" in normalized:
+        raise ValueError("where_sql cannot contain SQL comments.")
+    if re.search(
+        r"\b(select|with|copy|create|insert|update|delete|drop|alter|attach|detach|pragma)\b",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        raise ValueError("where_sql must be a filter expression only.")
     return normalized
 
 
@@ -429,6 +487,713 @@ def deduplicate_csv(
             "rows_after": int(after),
             "removed_rows": int(before - after),
         }
+
+
+@mcp.tool()
+def filter_csv(
+    csv_path: str,
+    where_sql: str,
+    output_path: str | None = None,
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """Filter CSV rows by condition and export a new CSV file."""
+    source = _resolve_csv_path(csv_path)
+    target = (
+        _resolve_output_path(str(source), output_path)
+        if output_path
+        else source.with_name(f"{source.stem}.filtered.csv")
+    )
+    safe_where = _validate_where_sql(where_sql)
+
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(source), ignore_errors)
+        before = con.execute(f'SELECT COUNT(*) FROM "{safe_table}"').fetchone()[0]
+
+        target_literal = _sql_string_literal(str(target))
+        ignore_errors_literal = "true" if ignore_errors else "false"
+        con.execute(
+            f"""
+            COPY (
+                SELECT *
+                FROM "{safe_table}"
+                WHERE {safe_where}
+            )
+            TO {target_literal}
+            WITH (FORMAT CSV, HEADER true)
+            """
+        )
+        after = con.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM read_csv_auto({target_literal}, sample_size=-1, ignore_errors={ignore_errors_literal})
+            """
+        ).fetchone()[0]
+
+    return {
+        "table_name": safe_table,
+        "source_csv": str(source),
+        "output_csv": str(target),
+        "where_sql": safe_where,
+        "rows_before": int(before),
+        "rows_after": int(after),
+        "removed_rows": int(before - after),
+    }
+
+
+@mcp.tool()
+def plot_basic(
+    csv_path: str,
+    chart_type: str,
+    x_field: str | None = None,
+    y_field: str | None = None,
+    color_field: str | None = None,
+    output_path: str = "plot_basic.png",
+    bins: int = 20,
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """Generate a basic chart from CSV data and save it to an image file."""
+    chart = chart_type.strip().lower()
+    if chart not in {"scatter", "line", "histogram", "box"}:
+        raise ValueError("chart_type must be one of: scatter, line, histogram, box.")
+    if bins <= 0:
+        raise ValueError("bins must be > 0.")
+
+    csv_file = _resolve_csv_path(csv_path)
+    target = _resolve_output_file_path(output_path, default_ext=".png")
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        columns = _list_columns(con, safe_table)
+        required: list[str] = []
+        if chart in {"scatter", "line"}:
+            if not x_field or not y_field:
+                raise ValueError(f"{chart} requires x_field and y_field.")
+            required.extend([x_field, y_field])
+        elif chart in {"histogram", "box"}:
+            value_field = (y_field or x_field or "").strip()
+            if not value_field:
+                raise ValueError(f"{chart} requires x_field or y_field as value field.")
+            required.append(value_field)
+        if color_field:
+            required.append(color_field)
+        _require_columns(columns, required)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        try:
+            if chart in {"scatter", "line"}:
+                x_id = _quote_identifier(x_field or "")
+                y_id = _quote_identifier(y_field or "")
+                if color_field:
+                    c_id = _quote_identifier(color_field)
+                    rows = con.execute(
+                        f"""
+                        SELECT {x_id}, {y_id}, {c_id}
+                        FROM "{safe_table}"
+                        WHERE {x_id} IS NOT NULL AND {y_id} IS NOT NULL
+                        ORDER BY {c_id}
+                        """
+                    ).fetchall()
+                    if not rows:
+                        raise ValueError("No rows available for plotting after NULL filtering.")
+                    grouped: dict[str, list[tuple[float, float]]] = {}
+                    for x_val, y_val, c_val in rows:
+                        x_num = _to_float(x_val)
+                        y_num = _to_float(y_val)
+                        if x_num is None or y_num is None:
+                            continue
+                        key = str(c_val)
+                        grouped.setdefault(key, []).append((x_num, y_num))
+                    if not grouped:
+                        raise ValueError("No numeric rows available for plotting.")
+                    for group, points in grouped.items():
+                        xs = [p[0] for p in points]
+                        ys = [p[1] for p in points]
+                        if chart == "scatter":
+                            ax.scatter(xs, ys, s=14, alpha=0.75, label=group)
+                        else:
+                            ax.plot(xs, ys, linewidth=1.2, label=group)
+                    ax.legend(loc="best", fontsize=8)
+                else:
+                    rows = con.execute(
+                        f"""
+                        SELECT {x_id}, {y_id}
+                        FROM "{safe_table}"
+                        WHERE {x_id} IS NOT NULL AND {y_id} IS NOT NULL
+                        """
+                    ).fetchall()
+                    xs: list[float] = []
+                    ys: list[float] = []
+                    for x_val, y_val in rows:
+                        x_num = _to_float(x_val)
+                        y_num = _to_float(y_val)
+                        if x_num is None or y_num is None:
+                            continue
+                        xs.append(x_num)
+                        ys.append(y_num)
+                    if not xs:
+                        raise ValueError("No numeric rows available for plotting.")
+                    if chart == "scatter":
+                        ax.scatter(xs, ys, s=14, alpha=0.75)
+                    else:
+                        ax.plot(xs, ys, linewidth=1.2)
+                ax.set_xlabel(x_field or "")
+                ax.set_ylabel(y_field or "")
+                ax.set_title(f"{chart.capitalize()} Plot")
+            elif chart == "histogram":
+                value_field = (y_field or x_field or "").strip()
+                field_id = _quote_identifier(value_field)
+                rows = con.execute(
+                    f"""
+                    SELECT TRY_CAST({field_id} AS DOUBLE) AS __v
+                    FROM "{safe_table}"
+                    WHERE TRY_CAST({field_id} AS DOUBLE) IS NOT NULL
+                    """
+                ).fetchall()
+                values = [float(r[0]) for r in rows]
+                if not values:
+                    raise ValueError("No numeric rows available for histogram.")
+                ax.hist(values, bins=int(bins), edgecolor="white")
+                ax.set_xlabel(value_field)
+                ax.set_ylabel("Count")
+                ax.set_title("Histogram")
+            else:
+                value_field = (y_field or x_field or "").strip()
+                field_id = _quote_identifier(value_field)
+                rows = con.execute(
+                    f"""
+                    SELECT TRY_CAST({field_id} AS DOUBLE) AS __v
+                    FROM "{safe_table}"
+                    WHERE TRY_CAST({field_id} AS DOUBLE) IS NOT NULL
+                    """
+                ).fetchall()
+                values = [float(r[0]) for r in rows]
+                if not values:
+                    raise ValueError("No numeric rows available for box plot.")
+                ax.boxplot(values, vert=True)
+                ax.set_ylabel(value_field)
+                ax.set_title("Box Plot")
+            fig.tight_layout()
+            fig.savefig(str(target), dpi=150)
+        finally:
+            plt.close(fig)
+
+    return {
+        "csv_path": str(csv_file),
+        "chart_type": chart,
+        "output_path": str(target),
+        "x_field": x_field,
+        "y_field": y_field,
+        "color_field": color_field,
+        "bins": int(bins),
+    }
+
+
+@mcp.tool()
+def extract_columns_to_csv(
+    csv_path: str,
+    output_path: str,
+    columns: list[str],
+    where_sql: str = "",
+    order_by: str = "",
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """Extract selected columns from a CSV file into a new CSV file."""
+    safe_columns = [c.strip() for c in columns if c and c.strip()]
+    if not safe_columns:
+        raise ValueError("columns cannot be empty.")
+
+    csv_file = _resolve_csv_path(csv_path)
+    target = _resolve_output_file_path(output_path, default_ext=".csv")
+    target_literal = _sql_string_literal(str(target))
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        available_columns = _list_columns(con, safe_table)
+        _require_columns(available_columns, safe_columns)
+
+        select_expr = ", ".join(_quote_identifier(c) for c in safe_columns)
+        where_clause = ""
+        if where_sql.strip():
+            where_clause = f"WHERE {where_sql.strip()}"
+        order_clause = ""
+        if order_by.strip():
+            order_expr = _safe_order_by(order_by, available_columns, "")
+            order_clause = f"ORDER BY {order_expr}"
+
+        con.execute(
+            f"""
+            COPY (
+                SELECT {select_expr}
+                FROM "{safe_table}"
+                {where_clause}
+                {order_clause}
+            )
+            TO {target_literal}
+            WITH (FORMAT CSV, HEADER true)
+            """
+        )
+        row_count = con.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM read_csv_auto({target_literal}, sample_size=-1, ignore_errors=false)
+            """
+        ).fetchone()[0]
+
+    return {
+        "source_csv": str(csv_file),
+        "output_csv": str(target),
+        "columns": safe_columns,
+        "where_sql": where_sql.strip() or None,
+        "order_by": order_by.strip() or None,
+        "row_count": int(row_count),
+    }
+
+
+@mcp.tool()
+def plot_categorical_scatter(
+    csv_path: str,
+    x_field: str,
+    y_field: str,
+    category_field: str,
+    output_path: str = "categorical_scatter.png",
+    dpi: int = 1200,
+    figsize: list[float] | None = None,
+    colormap: str = "tab10",
+    point_size: float = 1.0,
+    alpha: float = 0.6,
+    title: str = "Categorical Scatter Plot",
+    x_label: str | None = None,
+    y_label: str | None = None,
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """Plot categorical scatter points with a discrete colormap and legend."""
+    if dpi <= 0:
+        raise ValueError("dpi must be > 0.")
+    if point_size <= 0:
+        raise ValueError("point_size must be > 0.")
+    if not (0 <= alpha <= 1):
+        raise ValueError("alpha must be between 0 and 1.")
+
+    raw_figsize = figsize or [12.0, 10.0]
+    if len(raw_figsize) != 2:
+        raise ValueError("figsize must contain exactly 2 numbers: [width, height].")
+    fig_w = _to_float(raw_figsize[0])
+    fig_h = _to_float(raw_figsize[1])
+    if fig_w is None or fig_h is None or fig_w <= 0 or fig_h <= 0:
+        raise ValueError("figsize values must be positive numbers.")
+
+    csv_file = _resolve_csv_path(csv_path)
+    target = _resolve_output_file_path(output_path, default_ext=".png")
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        columns = _list_columns(con, safe_table)
+        _require_columns(columns, [x_field, y_field, category_field])
+
+        x_id = _quote_identifier(x_field)
+        y_id = _quote_identifier(y_field)
+        category_id = _quote_identifier(category_field)
+        rows = con.execute(
+            f"""
+            SELECT {x_id}, {y_id}, {category_id}
+            FROM "{safe_table}"
+            WHERE {x_id} IS NOT NULL
+              AND {y_id} IS NOT NULL
+              AND {category_id} IS NOT NULL
+            """
+        ).fetchall()
+        if not rows:
+            raise ValueError("No rows available for plotting after NULL filtering.")
+
+        grouped: dict[str, list[tuple[float, float]]] = {}
+        for x_val, y_val, category_val in rows:
+            x_num = _to_float(x_val)
+            y_num = _to_float(y_val)
+            if x_num is None or y_num is None:
+                continue
+            key = str(category_val)
+            grouped.setdefault(key, []).append((x_num, y_num))
+        if not grouped:
+            raise ValueError("No numeric rows available for plotting.")
+
+        categories = sorted(grouped.keys())
+        cmap = plt.get_cmap(colormap, max(1, len(categories)))
+        fig, ax = plt.subplots(figsize=(float(fig_w), float(fig_h)))
+        try:
+            for idx, category in enumerate(categories):
+                points = grouped[category]
+                xs = [p[0] for p in points]
+                ys = [p[1] for p in points]
+                ax.scatter(
+                    xs,
+                    ys,
+                    s=float(point_size),
+                    alpha=float(alpha),
+                    color=[cmap(idx)],
+                    label=category,
+                )
+
+            ax.set_xlabel((x_label or x_field).strip())
+            ax.set_ylabel((y_label or y_field).strip())
+            ax.set_title(title.strip() or "Categorical Scatter Plot")
+            ax.legend(
+                title=category_field,
+                loc="best",
+                fontsize=8,
+                markerscale=3,
+                frameon=True,
+            )
+            fig.tight_layout()
+            fig.savefig(str(target), dpi=int(dpi))
+        finally:
+            plt.close(fig)
+
+    return {
+        "csv_path": str(csv_file),
+        "output_path": str(target),
+        "x_field": x_field,
+        "y_field": y_field,
+        "category_field": category_field,
+        "category_count": len(categories),
+        "point_count": sum(len(points) for points in grouped.values()),
+        "dpi": int(dpi),
+        "figsize": [float(fig_w), float(fig_h)],
+        "colormap": colormap,
+    }
+
+
+@mcp.tool()
+def plot_time_series(
+    csv_path: str,
+    time_field: str,
+    value_fields: list[str],
+    output_path: str,
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """Plot one or more value fields against a timestamp field."""
+    safe_values = [f.strip() for f in value_fields if f and f.strip()]
+    if not safe_values:
+        raise ValueError("value_fields cannot be empty.")
+
+    csv_file = _resolve_csv_path(csv_path)
+    target = _resolve_output_file_path(output_path, default_ext=".png")
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        columns = _list_columns(con, safe_table)
+        _require_columns(columns, [time_field] + safe_values)
+        time_id = _quote_identifier(time_field)
+        value_ids = [_quote_identifier(f) for f in safe_values]
+        select_values = ", ".join(value_ids)
+        rows = con.execute(
+            f"""
+            SELECT TRY_CAST({time_id} AS TIMESTAMP) AS __ts, {select_values}
+            FROM "{safe_table}"
+            WHERE TRY_CAST({time_id} AS TIMESTAMP) IS NOT NULL
+            ORDER BY __ts
+            """
+        ).fetchall()
+        if not rows:
+            raise ValueError("No valid timestamp rows available for plotting.")
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        try:
+            for idx, field in enumerate(safe_values, start=1):
+                xs: list[Any] = []
+                ys: list[float] = []
+                for row in rows:
+                    value = _to_float(row[idx])
+                    if value is None:
+                        continue
+                    xs.append(row[0])
+                    ys.append(value)
+                if xs:
+                    ax.plot(xs, ys, linewidth=1.2, label=field)
+            if not ax.lines:
+                raise ValueError("No numeric values available for value_fields.")
+            ax.set_xlabel(time_field)
+            ax.set_ylabel("Value")
+            ax.set_title("Time Series")
+            ax.legend(loc="best", fontsize=8)
+            fig.autofmt_xdate()
+            fig.tight_layout()
+            fig.savefig(str(target), dpi=150)
+        finally:
+            plt.close(fig)
+
+    return {
+        "csv_path": str(csv_file),
+        "time_field": time_field,
+        "value_fields": safe_values,
+        "output_path": str(target),
+        "row_count": len(rows),
+    }
+
+
+@mcp.tool()
+def plot_geo(
+    csv_path: str,
+    x_field: str,
+    y_field: str,
+    output_path: str,
+    color_field: str | None = None,
+    size_field: str | None = None,
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """Plot geographic points using x/y coordinate fields."""
+    csv_file = _resolve_csv_path(csv_path)
+    target = _resolve_output_file_path(output_path, default_ext=".png")
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        columns = _list_columns(con, safe_table)
+        required = [x_field, y_field]
+        if color_field:
+            required.append(color_field)
+        if size_field:
+            required.append(size_field)
+        _require_columns(columns, required)
+
+        x_id = _quote_identifier(x_field)
+        y_id = _quote_identifier(y_field)
+        select_parts = [x_id, y_id]
+        if color_field:
+            select_parts.append(_quote_identifier(color_field))
+        if size_field:
+            select_parts.append(_quote_identifier(size_field))
+        select_expr = ", ".join(select_parts)
+        rows = con.execute(
+            f"""
+            SELECT {select_expr}
+            FROM "{safe_table}"
+            WHERE {x_id} IS NOT NULL AND {y_id} IS NOT NULL
+            """
+        ).fetchall()
+        if not rows:
+            raise ValueError("No rows available for geo plotting.")
+
+        xs: list[float] = []
+        ys: list[float] = []
+        colors: list[str] = []
+        sizes: list[float] = []
+        for row in rows:
+            x_num = _to_float(row[0])
+            y_num = _to_float(row[1])
+            if x_num is None or y_num is None:
+                continue
+            xs.append(x_num)
+            ys.append(y_num)
+            cursor = 2
+            if color_field:
+                colors.append(str(row[cursor]))
+                cursor += 1
+            if size_field:
+                size_num = _to_float(row[cursor])
+                sizes.append(size_num if size_num is not None else 20.0)
+        if not xs:
+            raise ValueError("No numeric coordinate rows available for geo plotting.")
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        try:
+            if color_field:
+                unique = sorted(set(colors))
+                palette: dict[str, int] = {label: idx for idx, label in enumerate(unique)}
+                c_values = [palette[c] for c in colors]
+                marker_sizes = sizes if size_field and len(sizes) == len(xs) else 20
+                scatter = ax.scatter(xs, ys, c=c_values, s=marker_sizes, alpha=0.75, cmap="viridis")
+                cbar = fig.colorbar(scatter, ax=ax)
+                cbar.set_label(color_field)
+            else:
+                marker_sizes = sizes if size_field and len(sizes) == len(xs) else 20
+                ax.scatter(xs, ys, s=marker_sizes, alpha=0.75)
+            ax.set_xlabel(x_field)
+            ax.set_ylabel(y_field)
+            ax.set_title("Geo Scatter Plot")
+            fig.tight_layout()
+            fig.savefig(str(target), dpi=150)
+        finally:
+            plt.close(fig)
+
+    return {
+        "csv_path": str(csv_file),
+        "x_field": x_field,
+        "y_field": y_field,
+        "color_field": color_field,
+        "size_field": size_field,
+        "output_path": str(target),
+        "row_count": len(xs),
+    }
+
+
+@mcp.tool()
+def analyze_correlation(
+    csv_path: str,
+    field_x: str,
+    field_y: str,
+    method: str = "pearson",
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """Compute correlation coefficient, p-value, and sample size for two fields."""
+    method_normalized = method.strip().lower()
+    if method_normalized not in {"pearson", "spearman"}:
+        raise ValueError("method must be pearson or spearman.")
+
+    csv_file = _resolve_csv_path(csv_path)
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        columns = _list_columns(con, safe_table)
+        _require_columns(columns, [field_x, field_y])
+        x_id = _quote_identifier(field_x)
+        y_id = _quote_identifier(field_y)
+        rows = con.execute(
+            f"""
+            SELECT TRY_CAST({x_id} AS DOUBLE) AS x, TRY_CAST({y_id} AS DOUBLE) AS y
+            FROM "{safe_table}"
+            WHERE TRY_CAST({x_id} AS DOUBLE) IS NOT NULL
+              AND TRY_CAST({y_id} AS DOUBLE) IS NOT NULL
+            """
+        ).fetchall()
+
+    if len(rows) < 2:
+        raise ValueError("At least 2 valid numeric samples are required.")
+    xs = [float(r[0]) for r in rows]
+    ys = [float(r[1]) for r in rows]
+    if method_normalized == "pearson":
+        result = scipy_stats.pearsonr(xs, ys)
+    else:
+        result = scipy_stats.spearmanr(xs, ys)
+    return {
+        "csv_path": str(csv_file),
+        "field_x": field_x,
+        "field_y": field_y,
+        "method": method_normalized,
+        "correlation": float(result.statistic),
+        "p_value": float(result.pvalue),
+        "sample_count": len(rows),
+    }
+
+
+@mcp.tool()
+def analyze_distribution(
+    csv_path: str,
+    field: str,
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """Compute descriptive distribution statistics for a numeric field."""
+    csv_file = _resolve_csv_path(csv_path)
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        columns = _list_columns(con, safe_table)
+        _require_columns(columns, [field])
+        field_id = _quote_identifier(field)
+        row = con.execute(
+            f"""
+            WITH base AS (
+                SELECT TRY_CAST({field_id} AS DOUBLE) AS __v
+                FROM "{safe_table}"
+                WHERE TRY_CAST({field_id} AS DOUBLE) IS NOT NULL
+            )
+            SELECT
+                COUNT(*) AS sample_count,
+                MIN(__v) AS min_value,
+                MAX(__v) AS max_value,
+                AVG(__v) AS mean_value,
+                MEDIAN(__v) AS median_value,
+                STDDEV_SAMP(__v) AS stddev,
+                quantile_cont(__v, 0.25) AS q1,
+                quantile_cont(__v, 0.75) AS q3
+            FROM base
+            """
+        ).fetchone()
+    sample_count = int(row[0]) if row else 0
+    if sample_count == 0:
+        raise ValueError("No valid numeric samples found for field.")
+    return {
+        "csv_path": str(csv_file),
+        "field": field,
+        "sample_count": sample_count,
+        "min": float(row[1]),
+        "max": float(row[2]),
+        "mean": float(row[3]),
+        "median": float(row[4]),
+        "std": float(row[5]) if row[5] is not None else None,
+        "q1": float(row[6]),
+        "q3": float(row[7]),
+    }
+
+
+@mcp.tool()
+def analyze_group_stats(
+    csv_path: str,
+    group_field: str,
+    value_fields: list[str],
+    stats: list[str] | None = None,
+    table_name: str = "tracks",
+    ignore_errors: bool = False,
+) -> dict[str, Any]:
+    """Compute grouped statistics for one or more numeric fields."""
+    safe_values = [f.strip() for f in value_fields if f and f.strip()]
+    if not safe_values:
+        raise ValueError("value_fields cannot be empty.")
+    safe_stats = [s.strip().lower() for s in (stats or ["mean", "std", "count"]) if s and s.strip()]
+    if not safe_stats:
+        raise ValueError("stats cannot be empty.")
+
+    supported = {"mean", "std", "count", "min", "max", "sum", "median"}
+    unsupported = [s for s in safe_stats if s not in supported]
+    if unsupported:
+        raise ValueError(f"Unsupported stats: {unsupported}")
+
+    csv_file = _resolve_csv_path(csv_path)
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        columns = _list_columns(con, safe_table)
+        _require_columns(columns, [group_field] + safe_values)
+
+        exprs: list[str] = [_quote_identifier(group_field)]
+        for field in safe_values:
+            field_id = _quote_identifier(field)
+            numeric_expr = f"TRY_CAST({field_id} AS DOUBLE)"
+            for stat_name in safe_stats:
+                alias = _quote_identifier(f"{field}__{stat_name}")
+                if stat_name == "count":
+                    exprs.append(f"COUNT({numeric_expr}) AS {alias}")
+                elif stat_name == "mean":
+                    exprs.append(f"AVG({numeric_expr}) AS {alias}")
+                elif stat_name == "std":
+                    exprs.append(f"STDDEV_SAMP({numeric_expr}) AS {alias}")
+                elif stat_name == "min":
+                    exprs.append(f"MIN({numeric_expr}) AS {alias}")
+                elif stat_name == "max":
+                    exprs.append(f"MAX({numeric_expr}) AS {alias}")
+                elif stat_name == "sum":
+                    exprs.append(f"SUM({numeric_expr}) AS {alias}")
+                else:
+                    exprs.append(f"MEDIAN({numeric_expr}) AS {alias}")
+
+        group_id = _quote_identifier(group_field)
+        sql = f"""
+            SELECT {", ".join(exprs)}
+            FROM "{safe_table}"
+            GROUP BY {group_id}
+            ORDER BY {group_id}
+        """
+        result = con.execute(sql)
+        result_columns = [d[0] for d in result.description]
+        rows = result.fetchall()
+
+    return {
+        "csv_path": str(csv_file),
+        "group_field": group_field,
+        "value_fields": safe_values,
+        "stats": safe_stats,
+        "columns": result_columns,
+        "rows": [list(r) for r in rows],
+        "group_count": len(rows),
+    }
 
 
 @mcp.tool()
@@ -709,6 +1474,76 @@ def workspace_read_text_file(path: str, start_line: int = 1, max_lines: int = 20
         "total_lines": len(lines),
         "truncated": end_idx < len(lines),
         "content": content,
+    }
+
+
+@mcp.tool()
+def workspace_write_text_file(content: str, append: bool = False) -> dict[str, Any]:
+    """写入工作区内已存在的 add.txt（仅允许该文件）。"""
+    file_path = _resolve_writable_workspace_text_file()
+
+    mode = "a" if append else "w"
+    with file_path.open(mode, encoding="utf-8") as f:
+        f.write(content)
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": file_path.relative_to(WORKSPACE_DIR).as_posix(),
+        "append": append,
+        "bytes_written": len(content.encode("utf-8")),
+        "file_size": int(file_path.stat().st_size),
+    }
+
+
+@mcp.tool()
+def workspace_replace_text_in_line(
+    line_number: int,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = False,
+) -> dict[str, Any]:
+    """在 add.txt 指定行内替换文本片段。"""
+    if line_number <= 0:
+        raise ValueError("line_number must be a positive integer.")
+    if old_text == "":
+        raise ValueError("old_text cannot be empty.")
+
+    file_path = _resolve_writable_workspace_text_file()
+    text = _read_utf8_text(file_path)
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        raise ValueError("Target file is empty.")
+    if line_number > len(lines):
+        raise ValueError(f"line_number out of range: {line_number} > {len(lines)}")
+
+    idx = line_number - 1
+    original_line = lines[idx]
+    line_break = ""
+    line_body = original_line
+    for candidate in ("\r\n", "\n", "\r"):
+        if original_line.endswith(candidate):
+            line_break = candidate
+            line_body = original_line[: -len(candidate)]
+            break
+
+    match_count = line_body.count(old_text)
+    if match_count == 0:
+        raise ValueError("old_text not found in target line.")
+
+    replaced_count = match_count if replace_all else 1
+    updated_body = line_body.replace(old_text, new_text, replaced_count)
+    lines[idx] = updated_body + line_break
+    file_path.write_text("".join(lines), encoding="utf-8")
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": file_path.relative_to(WORKSPACE_DIR).as_posix(),
+        "line_number": line_number,
+        "replace_all": replace_all,
+        "replaced_count": replaced_count,
+        "line_before": line_body,
+        "line_after": updated_body,
+        "file_size": int(file_path.stat().st_size),
     }
 
 
