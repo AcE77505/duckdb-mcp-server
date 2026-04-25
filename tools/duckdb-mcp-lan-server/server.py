@@ -692,6 +692,12 @@ def plot_basic(
     y_field: str | None = None,
     color_field: str | None = None,
     output_path: str = "plot_basic.png",
+    dpi: int = 300,
+    point_size: float = 14.0,
+    alpha: float = 0.75,
+    title: str | None = None,
+    x_label: str | None = None,
+    y_label: str | None = None,
     bins: int = 20,
     table_name: str = "tracks",
     ignore_errors: bool = False,
@@ -702,6 +708,12 @@ def plot_basic(
         raise ValueError("chart_type must be one of: scatter, line, histogram, box.")
     if bins <= 0:
         raise ValueError("bins must be > 0.")
+    if dpi <= 0:
+        raise ValueError("dpi must be > 0.")
+    if point_size <= 0:
+        raise ValueError("point_size must be > 0.")
+    if not (0 <= alpha <= 1):
+        raise ValueError("alpha must be between 0 and 1.")
 
     csv_file = _resolve_csv_path(csv_path)
     target = _resolve_output_file_path(output_path, default_ext=".png")
@@ -753,7 +765,7 @@ def plot_basic(
                         xs = [p[0] for p in points]
                         ys = [p[1] for p in points]
                         if chart == "scatter":
-                            ax.scatter(xs, ys, s=14, alpha=0.75, label=group)
+                            ax.scatter(xs, ys, s=point_size, alpha=alpha, label=group)
                         else:
                             ax.plot(xs, ys, linewidth=1.2, label=group)
                     ax.legend(loc="best", fontsize=8)
@@ -777,12 +789,12 @@ def plot_basic(
                     if not xs:
                         raise ValueError("No numeric rows available for plotting.")
                     if chart == "scatter":
-                        ax.scatter(xs, ys, s=14, alpha=0.75)
+                        ax.scatter(xs, ys, s=point_size, alpha=alpha)
                     else:
                         ax.plot(xs, ys, linewidth=1.2)
-                ax.set_xlabel(x_field or "")
-                ax.set_ylabel(y_field or "")
-                ax.set_title(f"{chart.capitalize()} Plot")
+                ax.set_xlabel(x_label if x_label is not None else (x_field or ""))
+                ax.set_ylabel(y_label if y_label is not None else (y_field or ""))
+                ax.set_title(title if title is not None else f"{chart.capitalize()} Plot")
             elif chart == "histogram":
                 value_field = (y_field or x_field or "").strip()
                 field_id = _quote_identifier(value_field)
@@ -797,9 +809,9 @@ def plot_basic(
                 if not values:
                     raise ValueError("No numeric rows available for histogram.")
                 ax.hist(values, bins=int(bins), edgecolor="white")
-                ax.set_xlabel(value_field)
-                ax.set_ylabel("Count")
-                ax.set_title("Histogram")
+                ax.set_xlabel(x_label if x_label is not None else value_field)
+                ax.set_ylabel(y_label if y_label is not None else "Count")
+                ax.set_title(title if title is not None else "Histogram")
             else:
                 value_field = (y_field or x_field or "").strip()
                 field_id = _quote_identifier(value_field)
@@ -814,10 +826,11 @@ def plot_basic(
                 if not values:
                     raise ValueError("No numeric rows available for box plot.")
                 ax.boxplot(values, vert=True)
-                ax.set_ylabel(value_field)
-                ax.set_title("Box Plot")
+                ax.set_ylabel(y_label if y_label is not None else value_field)
+                ax.set_xlabel(x_label if x_label is not None else "")
+                ax.set_title(title if title is not None else "Box Plot")
             fig.tight_layout()
-            fig.savefig(str(target), dpi=150)
+            fig.savefig(str(target), dpi=int(dpi))
         finally:
             plt.close(fig)
 
@@ -828,6 +841,12 @@ def plot_basic(
         "x_field": x_field,
         "y_field": y_field,
         "color_field": color_field,
+        "dpi": int(dpi),
+        "point_size": float(point_size),
+        "alpha": float(alpha),
+        "title": title,
+        "x_label": x_label,
+        "y_label": y_label,
         "bins": int(bins),
     }
 
