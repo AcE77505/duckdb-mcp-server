@@ -290,6 +290,31 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+def _json_compatible_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if hasattr(value, "isoformat") and callable(value.isoformat):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _rows_to_records(columns: list[str], rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        records.append(
+            {
+                columns[idx]: _json_compatible_value(value)
+                for idx, value in enumerate(row)
+            }
+        )
+    return records
+
+
 def _safe_order_by(order_by: str | None, allowed_columns: set[str], fallback_expr: str) -> str:
     if not order_by:
         return fallback_expr
@@ -425,6 +450,124 @@ def query_csv(
             "columns": cols,
             "rows": [list(r) for r in rows],
         }
+
+
+@mcp.tool()
+def query_csv_to_csv(
+    csv_path: str,
+    sql: str,
+    output_path: str,
+    table_name: str = "tracks",
+    ignore_errors: bool = True,
+    max_preview_rows: int = 10,
+) -> dict[str, Any]:
+    """对 CSV 执行 SQL 并将查询结果导出为新的 CSV。"""
+    if max_preview_rows < 0:
+        raise ValueError("max_preview_rows must be >= 0.")
+    if max_preview_rows > 200:
+        raise ValueError("max_preview_rows must be <= 200.")
+
+    source = _resolve_csv_path(csv_path)
+    target = _resolve_output_file_path(output_path, default_ext=".csv")
+    target_literal = _sql_string_literal(str(target))
+    safe_sql = _validate_query_sql(sql)
+
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(source), ignore_errors)
+        query_sql = safe_sql.rstrip().rstrip(";")
+        con.execute(
+            f"""
+            COPY (
+                {query_sql}
+            )
+            TO {target_literal}
+            WITH (FORMAT CSV, HEADER true)
+            """
+        )
+
+        ignore_errors_literal = "true" if ignore_errors else "false"
+        preview_result = con.execute(
+            f"""
+            SELECT *
+            FROM read_csv_auto({target_literal}, sample_size=-1, ignore_errors={ignore_errors_literal})
+            LIMIT {int(max_preview_rows)}
+            """
+        )
+        preview_columns = [d[0] for d in preview_result.description]
+        preview_rows = preview_result.fetchall()
+        row_count = con.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM read_csv_auto({target_literal}, sample_size=-1, ignore_errors={ignore_errors_literal})
+            """
+        ).fetchone()[0]
+
+    return {
+        "success": True,
+        "table_name": safe_table,
+        "input_path": str(source),
+        "output_path": str(target),
+        "row_count": int(row_count),
+        "columns": preview_columns,
+        "preview_rows": _rows_to_records(preview_columns, preview_rows),
+    }
+
+
+@mcp.tool()
+def write_rows_to_csv(
+    output_path: str,
+    columns: list[str],
+    rows: list[list[Any]],
+    overwrite: bool = True,
+) -> dict[str, Any]:
+    """将列名与二维行数据写入 CSV 文件。"""
+    safe_columns = [c.strip() for c in columns]
+    if not safe_columns:
+        raise ValueError("columns cannot be empty.")
+    if any(not c for c in safe_columns):
+        raise ValueError("columns cannot contain empty names.")
+
+    if len(set(safe_columns)) != len(safe_columns):
+        raise ValueError("columns contains duplicate names.")
+
+    target = _resolve_output_file_path(output_path, default_ext=".csv")
+    if target.exists() and not overwrite:
+        raise ValueError(f"Output file already exists and overwrite is false: {target}")
+
+    for idx, row in enumerate(rows):
+        if len(row) != len(safe_columns):
+            raise ValueError(
+                f"Row length mismatch at index {idx}. "
+                f"Expected {len(safe_columns)} values, got {len(row)}."
+            )
+
+    with duckdb.connect(database=":memory:") as con:
+        column_defs = ", ".join(f"{_quote_identifier(c)} VARCHAR" for c in safe_columns)
+        con.execute(f'CREATE TABLE "__write_rows_tmp" ({column_defs})')
+        if rows:
+            placeholders = ", ".join("?" for _ in safe_columns)
+            con.executemany(
+                f'INSERT INTO "__write_rows_tmp" VALUES ({placeholders})',
+                rows,
+            )
+        target_literal = _sql_string_literal(str(target))
+        con.execute(
+            f"""
+            COPY (
+                SELECT * FROM "__write_rows_tmp"
+            )
+            TO {target_literal}
+            WITH (FORMAT CSV, HEADER true)
+            """
+        )
+
+    return {
+        "success": True,
+        "output_path": str(target),
+        "columns": safe_columns,
+        "row_count": len(rows),
+        "overwrite": overwrite,
+    }
 
 
 @mcp.tool()

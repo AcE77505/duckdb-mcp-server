@@ -104,6 +104,10 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 返回推断字段和总行数
 - `query_csv(csv_path, sql, table_name="tracks", max_rows=1000, ignore_errors=False)`
   - 对 CSV 执行 SQL（SQL 中使用 `table_name` 作为表名，`max_rows` 上限 10000）
+- `query_csv_to_csv(csv_path, sql, output_path, table_name="tracks", ignore_errors=True, max_preview_rows=10)`
+  - 对输入 CSV 执行 SQL 并导出结果到新的 CSV，返回输出行数、列名与预览数据
+- `write_rows_to_csv(output_path, columns, rows, overwrite=True)`
+  - 直接将列名与二维行数据写入 CSV 文件，适合把上游计算结果落盘
 - `deduplicate_csv(csv_path, key_columns, output_path=None, table_name="tracks", order_by=None, ignore_errors=False)`
   - 按 key 列去重，输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.dedup.csv`）
 - `filter_csv(csv_path, where_sql, output_path=None, table_name="tracks", ignore_errors=False)`
