@@ -128,6 +128,12 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 返回分布统计（最小值、最大值、均值、中位数、标准差、四分位数等）
 - `analyze_group_stats(csv_path, group_field, value_fields, stats=None, table_name="tracks", ignore_errors=False)`
   - 按分组字段输出多字段统计结果（支持 `mean/std/count/min/max/sum/median`）
+- `analyze_linear_regression(csv_path, x_field, y_field, table_name="tracks", where_sql="", ignore_errors=True)`
+  - 线性回归分析，直接返回 `slope`、`intercept`、`r2`、`p_value`、`n` 与回归方程
+- `analyze_binned_stats(csv_path, x_field, y_field, bin_width, table_name="tracks", where_sql="", output_path=None, ignore_errors=True, max_preview_rows=10)`
+  - 按 `x_field` 分箱统计 `y_field`，输出每个密度区间的 `count/mean/median/std/min/max/q25/q75`，并可导出为 CSV
+- `plot_scatter_with_fit(csv_path, x_field, y_field, output_path="scatter_with_fit.png", table_name="tracks", where_sql="", dpi=300, point_size=2.0, alpha=0.35, title=None, x_label=None, y_label=None, fit_type="linear", show_equation=True, bin_width=0.005, show_errorbar=False, ignore_errors=True)`
+  - 论文向散点图工具：支持线性拟合线或分箱均值线（可选误差棒），并输出拟合关键指标
 - `duckdb_health()`
   - 返回 `{ ok, duckdbVersion, dbPath, time }`，用于连通性检测（`time` 为 ISO8601）
 - `duckdb_list_tables(includeViews=true)`
