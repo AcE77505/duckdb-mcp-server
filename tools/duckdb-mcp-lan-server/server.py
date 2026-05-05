@@ -2903,6 +2903,44 @@ def _resolve_mupdf_path(path: str) -> Path:
     return resolved
 
 
+
+
+@mcp.tool()
+def mupdf_read_tables(pdf_path: str, page: int = 1) -> dict[str, Any]:
+    """PyMuPDF 主方法：读取表格。兼容保留 `pdf_read_tables`（后备/旧接口）。"""
+    return pdf_read_tables(pdf_path=pdf_path, page=page)
+
+
+@mcp.tool()
+def mupdf_identify_element_types(pdf_path: str, page: int = 1) -> dict[str, Any]:
+    """PyMuPDF 主方法：识别元素类型。兼容保留 `pdf_identify_element_types`（后备/旧接口）。"""
+    return pdf_identify_element_types(pdf_path=pdf_path, page=page)
+
+
+@mcp.tool()
+def mupdf_identify_formulas(pdf_path: str, page: int = 1) -> dict[str, Any]:
+    """PyMuPDF 主方法：识别公式。兼容保留 `pdf_identify_formulas`（后备/旧接口）。"""
+    return pdf_identify_formulas(pdf_path=pdf_path, page=page)
+
+
+@mcp.tool()
+def mupdf_extract_element_coordinates(
+    pdf_path: str,
+    page: int = 1,
+    element_types: list[str] | None = None,
+) -> dict[str, Any]:
+    """PyMuPDF 主方法：提取元素坐标。兼容保留 `pdf_extract_element_coordinates`（后备/旧接口）。"""
+    return pdf_extract_element_coordinates(pdf_path=pdf_path, page=page, element_types=element_types)
+
+
+@mcp.tool()
+def mupdf_extract_element_styles(
+    pdf_path: str,
+    page: int = 1,
+    mode: str = "detailed",
+) -> dict[str, Any]:
+    """PyMuPDF 主方法：提取元素样式。兼容保留 `pdf_extract_element_styles`（后备/旧接口）。"""
+    return pdf_extract_element_styles(pdf_path=pdf_path, page=page, mode=mode)
 @mcp.tool()
 def mupdf_get_capabilities() -> dict[str, Any]:
     """返回当前服务可用的 PyMuPDF / PyMuPDF4LLM / PyMuPDF Pro 能力清单。"""
