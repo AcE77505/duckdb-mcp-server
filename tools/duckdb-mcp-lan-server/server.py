@@ -296,7 +296,7 @@ _MATH_FONT_RE = re.compile(
 
 # Pattern for numbered / bulleted list items.
 _NUMBERED_LIST_RE = re.compile(r"^\s*(\d+[.)]\s|[a-zA-Z][.)]\s|[•·▪▸◦‣⁃➢➣➤])")
-_CAPTION_RE = re.compile(r"^\s*(figure|fig\.|table)\s+\d+", re.IGNORECASE)
+_CAPTION_RE = re.compile(r"^\s*(figure|fig\.?|table)\s*[\.:]?\s*\d+", re.IGNORECASE)
 _REFERENCE_RE = re.compile(r"^\s*(\[\d+\]|\d+\.)\s+\S+")
 _EQUATION_INLINE_RE = re.compile(r"[A-Za-z]\s*=\s*[\w(]")
 _HEADING_NUMBERED_RE = re.compile(r"^\s*\d+(\.\d+){0,2}\s+[A-Z]")
@@ -366,7 +366,7 @@ def _classify_block_type(
     # Position-based header / footer detection.
     if y1 <= page_height * _HEADER_FOOTER_MARGIN:
         return "header"
-    if y0 >= max(page_height * (1.0 - _HEADER_FOOTER_MARGIN), 700.0):
+    if y0 >= page_height * 0.88 or y0 >= 700.0:
         return "footer"
 
     block_text = _extract_block_text(block)
@@ -460,6 +460,9 @@ def _infer_text_tables_from_words(fitz_page: Any) -> list[dict[str, Any]]:
         row_words.sort(key=lambda it: it[0])
         if len(row_words) < 4:
             continue
+        max_gap = max((row_words[i + 1][0] - row_words[i][2]) for i in range(len(row_words) - 1))
+        if max_gap < 12:
+            continue
         cells = [w[4] for w in row_words]
         xs = [round(w[0], 1) for w in row_words]
         bbox = (min(w[0] for w in row_words), min(w[1] for w in row_words), max(w[2] for w in row_words), max(w[3] for w in row_words))
@@ -471,12 +474,22 @@ def _infer_text_tables_from_words(fitz_page: Any) -> list[dict[str, Any]]:
     for col_count, rows in grouped.items():
         if col_count < 4 or len(rows) < 3:
             continue
+        # keep compact row groups only, avoid absorbing full-paragraph prose
+        rows = sorted(rows, key=lambda r: float(r["bbox"][1]))
+        compact_rows: list[dict[str, Any]] = [rows[0]]
+        for row in rows[1:]:
+            if float(row["bbox"][1]) - float(compact_rows[-1]["bbox"][3]) <= 18:
+                compact_rows.append(row)
+        if len(compact_rows) < 3:
+            continue
         x0 = min(float(r["bbox"][0]) for r in rows)
         y0 = min(float(r["bbox"][1]) for r in rows)
         x1 = max(float(r["bbox"][2]) for r in rows)
         y1 = max(float(r["bbox"][3]) for r in rows)
-        rows_sorted = sorted(rows, key=lambda r: float(r["bbox"][1]))
-        tables.append({"bbox": [x0, y0, x1, y1], "row_count": len(rows_sorted), "col_count": col_count, "data": [r["cells"] for r in rows_sorted], "source": "word-grid"})
+        text_density = sum(len(" ".join(r["cells"])) for r in compact_rows) / max(1.0, (x1 - x0) * (y1 - y0))
+        if text_density > 0.08:
+            continue
+        tables.append({"bbox": [x0, y0, x1, y1], "row_count": len(compact_rows), "col_count": col_count, "data": [r["cells"] for r in compact_rows], "source": "word-grid"})
     return tables
 
 
@@ -2494,11 +2507,11 @@ def pdf_identify_element_types(
                     has_bold = has_bold or bool(int(span.get("flags", 0)) & _FLAG_BOLD)
             if elem_type == "equation" and not _looks_like_equation(block_text):
                 elem_type = "text"
-            if elem_type == "text" and (_HEADING_NUMBERED_RE.match(block_text) or has_bold) and max_font >= avg_size + 0.8:
+            if elem_type in {"text", "list"} and (_HEADING_NUMBERED_RE.match(block_text) or has_bold) and max_font >= avg_size + 0.6:
                 elem_type = "heading1"
-            elif elem_type == "text" and (_HEADING_NUMBERED_RE.match(block_text) or has_bold) and max_font >= avg_size + 0.2:
+            elif elem_type in {"text", "list"} and (_HEADING_NUMBERED_RE.match(block_text) or has_bold) and max_font >= avg_size:
                 elem_type = "heading2"
-            elif elem_type == "text" and _HEADING_NUMBERED_RE.match(block_text):
+            elif elem_type in {"text", "list"} and _HEADING_NUMBERED_RE.match(block_text):
                 elem_type = "heading3"
             bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
             elements.append(
@@ -2724,7 +2737,8 @@ def pdf_identify_formulas(
                 continue
             math_symbol_count = sum(1 for ch in block_text if _is_math_char(ch))
             op_count = len(re.findall(r"[=+\-*/^<>≤≥∑∫√]", block_text))
-            confidence = min(0.99, round(0.4 + 0.1 * math_symbol_count + 0.08 * op_count, 2))
+            has_equals = "=" in block_text
+            confidence = min(0.99, round(0.35 + (0.22 if has_equals else 0.0) + 0.08 * math_symbol_count + 0.07 * op_count, 2))
             fragments.append(
                 {
                     "block_index": block_idx,
@@ -2742,8 +2756,9 @@ def pdf_identify_formulas(
                 continue
             last = formulas[-1]
             same_line = abs(frag["bbox"][1] - last["bbox"][1]) <= 8
-            near_block = frag["bbox"][1] - last["bbox"][3] <= 10
-            if same_line or near_block:
+            vertical_gap = frag["bbox"][1] - last["bbox"][3]
+            near_block = 0 <= vertical_gap <= 4
+            if same_line or (near_block and len(frag["text"]) < 40 and len(last["text"]) < 120):
                 last["text"] = f"{last['text']} {frag['text']}".strip()
                 last["bbox"] = [
                     min(last["bbox"][0], frag["bbox"][0]),
