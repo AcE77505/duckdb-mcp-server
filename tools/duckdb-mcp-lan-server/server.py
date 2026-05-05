@@ -2946,11 +2946,38 @@ def mupdf_get_capabilities() -> dict[str, Any]:
 
 @mcp.tool()
 def mupdf_run_python(code: str) -> dict[str, Any]:
-    """执行 PyMuPDF Python 代码片段（受限沙箱），用于覆盖全量 API 能力。"""
+    """执行 PyMuPDF Python 代码片段（受限沙箱，允许标准库与 PyMuPDF 导入）。"""
     if fitz is None:
         raise ValueError("PyMuPDF is required. Install pymupdf>=1.27.2.")
     if not code or not code.strip():
         raise ValueError("code cannot be empty.")
+
+    allowed_import_roots = {
+        "math",
+        "json",
+        "re",
+        "statistics",
+        "decimal",
+        "fractions",
+        "itertools",
+        "functools",
+        "collections",
+        "datetime",
+        "pathlib",
+        "typing",
+        "pymupdf",
+        "fitz",
+    }
+
+    def _safe_import(name: str, globals_: Any = None, locals_: Any = None, fromlist: Any = (), level: int = 0) -> Any:
+        root = name.split(".", 1)[0]
+        if root not in allowed_import_roots:
+            raise ValueError(f"Import not allowed in mupdf sandbox: {name}")
+        if name == "fitz" and fitz is not None:
+            return fitz
+        if name == "pymupdf" and fitz is not None:
+            return fitz
+        return __import__(name, globals_, locals_, fromlist, level)
 
     safe_builtins: dict[str, Any] = {
         "abs": abs,
@@ -2974,6 +3001,7 @@ def mupdf_run_python(code: str) -> dict[str, Any]:
         "sum": sum,
         "tuple": tuple,
         "zip": zip,
+        "__import__": _safe_import,
     }
 
     def _open_workspace_doc(path: str) -> Any:
