@@ -1,6 +1,7 @@
 import os
 import re
 import json
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -298,6 +299,7 @@ _NUMBERED_LIST_RE = re.compile(r"^\s*(\d+[.)]\s|[a-zA-Z][.)]\s|[•·▪▸◦�
 _CAPTION_RE = re.compile(r"^\s*(figure|fig\.|table)\s+\d+", re.IGNORECASE)
 _REFERENCE_RE = re.compile(r"^\s*(\[\d+\]|\d+\.)\s+\S+")
 _EQUATION_INLINE_RE = re.compile(r"[A-Za-z]\s*=\s*[\w(]")
+_HEADING_NUMBERED_RE = re.compile(r"^\s*\d+(\.\d+){0,2}\s+[A-Z]")
 
 # Fraction of page height treated as header / footer margin.
 _HEADER_FOOTER_MARGIN = 0.08
@@ -328,11 +330,16 @@ def _extract_block_text(block: dict[str, Any]) -> str:
 def _looks_like_equation(text: str) -> bool:
     if not text:
         return False
+    word_count = len(re.findall(r"\b\w+\b", text))
+    if word_count > 20 and not _contains_math(text):
+        return False
     if text.count("=") >= 1 and (_contains_math(text) or _EQUATION_INLINE_RE.search(text)):
         return True
     symbol_hits = sum(1 for ch in text if _is_math_char(ch))
     operator_hits = len(re.findall(r"[=+\-*/^<>≤≥∑∫√]", text))
-    return symbol_hits >= 2 or operator_hits >= 3
+    if symbol_hits >= 2 and word_count <= 16:
+        return True
+    return operator_hits >= 3 and word_count <= 16
 
 
 def _classify_block_type(
@@ -359,11 +366,11 @@ def _classify_block_type(
     # Position-based header / footer detection.
     if y1 <= page_height * _HEADER_FOOTER_MARGIN:
         return "header"
-    if y0 >= page_height * (1.0 - _HEADER_FOOTER_MARGIN):
+    if y0 >= max(page_height * (1.0 - _HEADER_FOOTER_MARGIN), 700.0):
         return "footer"
 
     block_text = _extract_block_text(block)
-    if _CAPTION_RE.match(block_text):
+    if _CAPTION_RE.match(block_text) and len(block_text) <= 140:
         return "caption"
     if _REFERENCE_RE.match(block_text):
         return "reference"
@@ -432,6 +439,44 @@ def _infer_text_tables_from_alignment(fitz_page: Any) -> list[dict[str, Any]]:
                 "source": "text-alignment",
             }
         )
+    return tables
+
+
+def _infer_text_tables_from_words(fitz_page: Any) -> list[dict[str, Any]]:
+    """Infer borderless tables from word coordinates (robust when lines are merged)."""
+    words = fitz_page.get_text("words")
+    if not words:
+        return []
+    rows_map: dict[float, list[tuple[float, float, float, float, str]]] = {}
+    for w in words:
+        x0, y0, x1, y1, text = float(w[0]), float(w[1]), float(w[2]), float(w[3]), str(w[4]).strip()
+        if not text:
+            continue
+        row_key = round((y0 + y1) / 2, 1)
+        rows_map.setdefault(row_key, []).append((x0, y0, x1, y1, text))
+    row_items = sorted(rows_map.items(), key=lambda it: it[0])
+    candidate_rows: list[dict[str, Any]] = []
+    for _, row_words in row_items:
+        row_words.sort(key=lambda it: it[0])
+        if len(row_words) < 4:
+            continue
+        cells = [w[4] for w in row_words]
+        xs = [round(w[0], 1) for w in row_words]
+        bbox = (min(w[0] for w in row_words), min(w[1] for w in row_words), max(w[2] for w in row_words), max(w[3] for w in row_words))
+        candidate_rows.append({"cells": cells, "x_positions": xs, "bbox": bbox})
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in candidate_rows:
+        grouped.setdefault(len(row["cells"]), []).append(row)
+    tables: list[dict[str, Any]] = []
+    for col_count, rows in grouped.items():
+        if col_count < 4 or len(rows) < 3:
+            continue
+        x0 = min(float(r["bbox"][0]) for r in rows)
+        y0 = min(float(r["bbox"][1]) for r in rows)
+        x1 = max(float(r["bbox"][2]) for r in rows)
+        y1 = max(float(r["bbox"][3]) for r in rows)
+        rows_sorted = sorted(rows, key=lambda r: float(r["bbox"][1]))
+        tables.append({"bbox": [x0, y0, x1, y1], "row_count": len(rows_sorted), "col_count": col_count, "data": [r["cells"] for r in rows_sorted], "source": "word-grid"})
     return tables
 
 
@@ -2447,10 +2492,14 @@ def pdf_identify_element_types(
                     size = float(span.get("size", 0.0))
                     max_font = max(max_font, size)
                     has_bold = has_bold or bool(int(span.get("flags", 0)) & _FLAG_BOLD)
-            if elem_type == "text" and has_bold and max_font >= avg_size + 0.5:
+            if elem_type == "equation" and not _looks_like_equation(block_text):
+                elem_type = "text"
+            if elem_type == "text" and (_HEADING_NUMBERED_RE.match(block_text) or has_bold) and max_font >= avg_size + 0.8:
                 elem_type = "heading1"
-            elif elem_type == "text" and has_bold and max_font >= avg_size:
+            elif elem_type == "text" and (_HEADING_NUMBERED_RE.match(block_text) or has_bold) and max_font >= avg_size + 0.2:
                 elem_type = "heading2"
+            elif elem_type == "text" and _HEADING_NUMBERED_RE.match(block_text):
+                elem_type = "heading3"
             bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
             elements.append(
                 {
@@ -2526,6 +2575,8 @@ def pdf_extract_element_coordinates(
                     "height": round(y1 - y0, 2),
                 }
             )
+        for order, elem in enumerate(sorted(elements, key=lambda e: (e["y0"], e["x0"])), start=1):
+            elem["reading_order"] = order
     finally:
         doc.close()
 
@@ -2537,6 +2588,12 @@ def pdf_extract_element_coordinates(
         if abs(cur["y0"] - nxt["y0"]) <= 2:
             relation = "same_row"
             distance = round(abs(nxt["x0"] - cur["x1"]), 2)
+        elif cur["x1"] <= nxt["x0"] and abs(cur["y0"] - nxt["y0"]) < max(cur["height"], nxt["height"]) * 0.8:
+            relation = "left_of"
+            distance = round(nxt["x0"] - cur["x1"], 2)
+        elif nxt["x1"] <= cur["x0"] and abs(cur["y0"] - nxt["y0"]) < max(cur["height"], nxt["height"]) * 0.8:
+            relation = "right_of"
+            distance = round(cur["x0"] - nxt["x1"], 2)
         elif cur["y1"] <= nxt["y0"]:
             relation = "above"
             distance = round(nxt["y0"] - cur["y1"], 2)
@@ -2594,6 +2651,8 @@ def pdf_read_tables(
                         "bbox": [round(v, 2) for v in tbl.bbox],
                         "row_count": len(rows_cleaned),
                         "col_count": max((len(r) for r in rows_cleaned), default=0),
+                        "headers": rows_cleaned[0] if rows_cleaned else [],
+                        "rows": rows_cleaned[1:] if len(rows_cleaned) > 1 else [],
                         "data": rows_cleaned,
                         "source": "detector",
                     }
@@ -2601,6 +2660,9 @@ def pdf_read_tables(
             if not tables_out:
                 diagnostics.append("No bordered table detected by find_tables(); trying text-alignment inference.")
                 inferred_tables = _infer_text_tables_from_alignment(fitz_page)
+                if not inferred_tables:
+                    diagnostics.append("Text-alignment inference empty; trying word-grid inference.")
+                    inferred_tables = _infer_text_tables_from_words(fitz_page)
                 for tbl_idx, tbl in enumerate(inferred_tables):
                     tables_out.append(
                         {
@@ -2608,6 +2670,8 @@ def pdf_read_tables(
                             "bbox": [round(v, 2) for v in tbl["bbox"]],
                             "row_count": tbl["row_count"],
                             "col_count": tbl["col_count"],
+                            "headers": tbl["data"][0] if tbl["data"] else [],
+                            "rows": tbl["data"][1:] if len(tbl["data"]) > 1 else [],
                             "data": tbl["data"],
                             "source": tbl["source"],
                         }
@@ -2647,7 +2711,7 @@ def pdf_identify_formulas(
         fitz_page = doc[page - 1]
         text_dict = fitz_page.get_text("dict")
 
-        formulas: list[dict[str, Any]] = []
+        fragments: list[dict[str, Any]] = []
         for block_idx, block in enumerate(text_dict.get("blocks", [])):
             if block.get("type", 0) != 0:
                 continue
@@ -2656,10 +2720,12 @@ def pdf_identify_formulas(
                 continue
             if "©" in block_text and len(block_text) < 8:
                 continue
+            if "=" not in block_text and len(re.findall(r"[+\-*/^∑∫√≤≥]", block_text)) < 2:
+                continue
             math_symbol_count = sum(1 for ch in block_text if _is_math_char(ch))
             op_count = len(re.findall(r"[=+\-*/^<>≤≥∑∫√]", block_text))
             confidence = min(0.99, round(0.4 + 0.1 * math_symbol_count + 0.08 * op_count, 2))
-            formulas.append(
+            fragments.append(
                 {
                     "block_index": block_idx,
                     "text": block_text,
@@ -2668,6 +2734,27 @@ def pdf_identify_formulas(
                     "type": "display" if len(block.get("lines", [])) > 1 else "inline",
                 }
             )
+        formulas: list[dict[str, Any]] = []
+        fragments_sorted = sorted(fragments, key=lambda f: (f["bbox"][1], f["bbox"][0]))
+        for frag in fragments_sorted:
+            if not formulas:
+                formulas.append(frag)
+                continue
+            last = formulas[-1]
+            same_line = abs(frag["bbox"][1] - last["bbox"][1]) <= 8
+            near_block = frag["bbox"][1] - last["bbox"][3] <= 10
+            if same_line or near_block:
+                last["text"] = f"{last['text']} {frag['text']}".strip()
+                last["bbox"] = [
+                    min(last["bbox"][0], frag["bbox"][0]),
+                    min(last["bbox"][1], frag["bbox"][1]),
+                    max(last["bbox"][2], frag["bbox"][2]),
+                    max(last["bbox"][3], frag["bbox"][3]),
+                ]
+                last["confidence"] = round(max(last["confidence"], frag["confidence"]), 2)
+                last["type"] = "display" if (last["type"] == "display" or frag["type"] == "display") else "inline"
+            else:
+                formulas.append(frag)
     finally:
         doc.close()
 
@@ -2704,7 +2791,9 @@ def pdf_extract_element_styles(
         elements: list[dict[str, Any]] = []
         fonts_used: set[str] = set()
         font_sizes: set[float] = set()
+        font_size_counts: Counter[float] = Counter()
         colors_used: set[str] = set()
+        line_spacings: list[float] = []
         for block_idx, block in enumerate(text_dict.get("blocks", [])):
             if block.get("type", 0) != 0:
                 continue
@@ -2718,6 +2807,7 @@ def pdf_extract_element_styles(
                 line_spacing: float | None = None
                 if prev_line_top is not None:
                     line_spacing = round(line_top - prev_line_top, 2)
+                    line_spacings.append(line_spacing)
                 prev_line_top = line_top
 
                 spans_out: list[dict[str, Any]] = []
@@ -2729,6 +2819,7 @@ def pdf_extract_element_styles(
                     color_hex = _int_to_hex_color(int(span.get("color", 0)))
                     fonts_used.add(span.get("font", ""))
                     font_sizes.add(round(float(span.get("size", 0.0)), 2))
+                    font_size_counts[round(float(span.get("size", 0.0)), 2)] += 1
                     colors_used.add(color_hex)
                     spans_out.append(
                         {
@@ -2769,7 +2860,14 @@ def pdf_extract_element_styles(
     summary = {
         "fonts_used": sorted(f for f in fonts_used if f),
         "font_sizes": sorted(font_sizes),
+        "font_size_counts": dict(sorted(font_size_counts.items(), key=lambda it: it[0])),
         "colors_used": sorted(colors_used),
+        "line_spacing_stats": {
+            "count": len(line_spacings),
+            "avg": round(sum(line_spacings) / len(line_spacings), 2) if line_spacings else None,
+            "min": min(line_spacings) if line_spacings else None,
+            "max": max(line_spacings) if line_spacings else None,
+        },
     }
     return {
         "workspace": str(WORKSPACE_DIR),
