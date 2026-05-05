@@ -290,6 +290,31 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+def _json_compatible_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if hasattr(value, "isoformat") and callable(value.isoformat):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _rows_to_records(columns: list[str], rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        records.append(
+            {
+                columns[idx]: _json_compatible_value(value)
+                for idx, value in enumerate(row)
+            }
+        )
+    return records
+
+
 def _safe_order_by(order_by: str | None, allowed_columns: set[str], fallback_expr: str) -> str:
     if not order_by:
         return fallback_expr
@@ -428,6 +453,124 @@ def query_csv(
 
 
 @mcp.tool()
+def query_csv_to_csv(
+    csv_path: str,
+    sql: str,
+    output_path: str,
+    table_name: str = "tracks",
+    ignore_errors: bool = True,
+    max_preview_rows: int = 10,
+) -> dict[str, Any]:
+    """对 CSV 执行 SQL 并将查询结果导出为新的 CSV。"""
+    if max_preview_rows < 0:
+        raise ValueError("max_preview_rows must be >= 0.")
+    if max_preview_rows > 200:
+        raise ValueError("max_preview_rows must be <= 200.")
+
+    source = _resolve_csv_path(csv_path)
+    target = _resolve_output_file_path(output_path, default_ext=".csv")
+    target_literal = _sql_string_literal(str(target))
+    safe_sql = _validate_query_sql(sql)
+
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(source), ignore_errors)
+        query_sql = safe_sql.rstrip().rstrip(";")
+        con.execute(
+            f"""
+            COPY (
+                {query_sql}
+            )
+            TO {target_literal}
+            WITH (FORMAT CSV, HEADER true)
+            """
+        )
+
+        ignore_errors_literal = "true" if ignore_errors else "false"
+        preview_result = con.execute(
+            f"""
+            SELECT *
+            FROM read_csv_auto({target_literal}, sample_size=-1, ignore_errors={ignore_errors_literal})
+            LIMIT {int(max_preview_rows)}
+            """
+        )
+        preview_columns = [d[0] for d in preview_result.description]
+        preview_rows = preview_result.fetchall()
+        row_count = con.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM read_csv_auto({target_literal}, sample_size=-1, ignore_errors={ignore_errors_literal})
+            """
+        ).fetchone()[0]
+
+    return {
+        "success": True,
+        "table_name": safe_table,
+        "input_path": str(source),
+        "output_path": str(target),
+        "row_count": int(row_count),
+        "columns": preview_columns,
+        "preview_rows": _rows_to_records(preview_columns, preview_rows),
+    }
+
+
+@mcp.tool()
+def write_rows_to_csv(
+    output_path: str,
+    columns: list[str],
+    rows: list[list[Any]],
+    overwrite: bool = True,
+) -> dict[str, Any]:
+    """将列名与二维行数据写入 CSV 文件。"""
+    safe_columns = [c.strip() for c in columns]
+    if not safe_columns:
+        raise ValueError("columns cannot be empty.")
+    if any(not c for c in safe_columns):
+        raise ValueError("columns cannot contain empty names.")
+
+    if len(set(safe_columns)) != len(safe_columns):
+        raise ValueError("columns contains duplicate names.")
+
+    target = _resolve_output_file_path(output_path, default_ext=".csv")
+    if target.exists() and not overwrite:
+        raise ValueError(f"Output file already exists and overwrite is false: {target}")
+
+    for idx, row in enumerate(rows):
+        if len(row) != len(safe_columns):
+            raise ValueError(
+                f"Row length mismatch at index {idx}. "
+                f"Expected {len(safe_columns)} values, got {len(row)}."
+            )
+
+    with duckdb.connect(database=":memory:") as con:
+        column_defs = ", ".join(f"{_quote_identifier(c)} VARCHAR" for c in safe_columns)
+        con.execute(f'CREATE TABLE "__write_rows_tmp" ({column_defs})')
+        if rows:
+            placeholders = ", ".join("?" for _ in safe_columns)
+            con.executemany(
+                f'INSERT INTO "__write_rows_tmp" VALUES ({placeholders})',
+                rows,
+            )
+        target_literal = _sql_string_literal(str(target))
+        con.execute(
+            f"""
+            COPY (
+                SELECT * FROM "__write_rows_tmp"
+            )
+            TO {target_literal}
+            WITH (FORMAT CSV, HEADER true)
+            """
+        )
+
+    return {
+        "success": True,
+        "output_path": str(target),
+        "columns": safe_columns,
+        "row_count": len(rows),
+        "overwrite": overwrite,
+    }
+
+
+@mcp.tool()
 def deduplicate_csv(
     csv_path: str,
     key_columns: list[str],
@@ -549,6 +692,12 @@ def plot_basic(
     y_field: str | None = None,
     color_field: str | None = None,
     output_path: str = "plot_basic.png",
+    dpi: int = 300,
+    point_size: float = 14.0,
+    alpha: float = 0.75,
+    title: str | None = None,
+    x_label: str | None = None,
+    y_label: str | None = None,
     bins: int = 20,
     table_name: str = "tracks",
     ignore_errors: bool = False,
@@ -559,6 +708,12 @@ def plot_basic(
         raise ValueError("chart_type must be one of: scatter, line, histogram, box.")
     if bins <= 0:
         raise ValueError("bins must be > 0.")
+    if dpi <= 0:
+        raise ValueError("dpi must be > 0.")
+    if point_size <= 0:
+        raise ValueError("point_size must be > 0.")
+    if not (0 <= alpha <= 1):
+        raise ValueError("alpha must be between 0 and 1.")
 
     csv_file = _resolve_csv_path(csv_path)
     target = _resolve_output_file_path(output_path, default_ext=".png")
@@ -610,7 +765,7 @@ def plot_basic(
                         xs = [p[0] for p in points]
                         ys = [p[1] for p in points]
                         if chart == "scatter":
-                            ax.scatter(xs, ys, s=14, alpha=0.75, label=group)
+                            ax.scatter(xs, ys, s=point_size, alpha=alpha, label=group)
                         else:
                             ax.plot(xs, ys, linewidth=1.2, label=group)
                     ax.legend(loc="best", fontsize=8)
@@ -634,12 +789,12 @@ def plot_basic(
                     if not xs:
                         raise ValueError("No numeric rows available for plotting.")
                     if chart == "scatter":
-                        ax.scatter(xs, ys, s=14, alpha=0.75)
+                        ax.scatter(xs, ys, s=point_size, alpha=alpha)
                     else:
                         ax.plot(xs, ys, linewidth=1.2)
-                ax.set_xlabel(x_field or "")
-                ax.set_ylabel(y_field or "")
-                ax.set_title(f"{chart.capitalize()} Plot")
+                ax.set_xlabel(x_label if x_label is not None else (x_field or ""))
+                ax.set_ylabel(y_label if y_label is not None else (y_field or ""))
+                ax.set_title(title if title is not None else f"{chart.capitalize()} Plot")
             elif chart == "histogram":
                 value_field = (y_field or x_field or "").strip()
                 field_id = _quote_identifier(value_field)
@@ -654,9 +809,9 @@ def plot_basic(
                 if not values:
                     raise ValueError("No numeric rows available for histogram.")
                 ax.hist(values, bins=int(bins), edgecolor="white")
-                ax.set_xlabel(value_field)
-                ax.set_ylabel("Count")
-                ax.set_title("Histogram")
+                ax.set_xlabel(x_label if x_label is not None else value_field)
+                ax.set_ylabel(y_label if y_label is not None else "Count")
+                ax.set_title(title if title is not None else "Histogram")
             else:
                 value_field = (y_field or x_field or "").strip()
                 field_id = _quote_identifier(value_field)
@@ -671,10 +826,11 @@ def plot_basic(
                 if not values:
                     raise ValueError("No numeric rows available for box plot.")
                 ax.boxplot(values, vert=True)
-                ax.set_ylabel(value_field)
-                ax.set_title("Box Plot")
+                ax.set_ylabel(y_label if y_label is not None else value_field)
+                ax.set_xlabel(x_label if x_label is not None else "")
+                ax.set_title(title if title is not None else "Box Plot")
             fig.tight_layout()
-            fig.savefig(str(target), dpi=150)
+            fig.savefig(str(target), dpi=int(dpi))
         finally:
             plt.close(fig)
 
@@ -685,6 +841,12 @@ def plot_basic(
         "x_field": x_field,
         "y_field": y_field,
         "color_field": color_field,
+        "dpi": int(dpi),
+        "point_size": float(point_size),
+        "alpha": float(alpha),
+        "title": title,
+        "x_label": x_label,
+        "y_label": y_label,
         "bins": int(bins),
     }
 
@@ -1193,6 +1355,272 @@ def analyze_group_stats(
         "columns": result_columns,
         "rows": [list(r) for r in rows],
         "group_count": len(rows),
+    }
+
+
+def _build_optional_where_clause(where_sql: str) -> str:
+    if not where_sql.strip():
+        return ""
+    safe_where = _validate_where_sql(where_sql)
+    return f"AND ({safe_where})"
+
+
+@mcp.tool()
+def analyze_linear_regression(
+    csv_path: str,
+    x_field: str,
+    y_field: str,
+    table_name: str = "tracks",
+    where_sql: str = "",
+    ignore_errors: bool = True,
+) -> dict[str, Any]:
+    """Run linear regression y ~ x and return slope/intercept/R²/p-value."""
+    csv_file = _resolve_csv_path(csv_path)
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        columns = _list_columns(con, safe_table)
+        _require_columns(columns, [x_field, y_field])
+        x_id = _quote_identifier(x_field)
+        y_id = _quote_identifier(y_field)
+        where_clause = _build_optional_where_clause(where_sql)
+        rows = con.execute(
+            f"""
+            SELECT TRY_CAST({x_id} AS DOUBLE) AS __x, TRY_CAST({y_id} AS DOUBLE) AS __y
+            FROM "{safe_table}"
+            WHERE TRY_CAST({x_id} AS DOUBLE) IS NOT NULL
+              AND TRY_CAST({y_id} AS DOUBLE) IS NOT NULL
+              {where_clause}
+            """
+        ).fetchall()
+
+    if len(rows) < 2:
+        raise ValueError("At least 2 valid numeric samples are required for linear regression.")
+    xs = [float(r[0]) for r in rows]
+    ys = [float(r[1]) for r in rows]
+    fit = scipy_stats.linregress(xs, ys)
+    r2 = float(fit.rvalue**2)
+    return {
+        "success": True,
+        "csv_path": str(csv_file),
+        "x_field": x_field,
+        "y_field": y_field,
+        "n": len(rows),
+        "slope": float(fit.slope),
+        "intercept": float(fit.intercept),
+        "r2": r2,
+        "p_value": float(fit.pvalue),
+        "equation": f"{y_field} = {fit.slope:.6g} * {x_field} + {fit.intercept:.6g}",
+        "where_sql": where_sql.strip() or None,
+    }
+
+
+@mcp.tool()
+def analyze_binned_stats(
+    csv_path: str,
+    x_field: str,
+    y_field: str,
+    bin_width: float,
+    table_name: str = "tracks",
+    where_sql: str = "",
+    output_path: str | None = None,
+    ignore_errors: bool = True,
+    max_preview_rows: int = 10,
+) -> dict[str, Any]:
+    """Bin x values and compute grouped descriptive statistics of y per bin."""
+    if bin_width <= 0:
+        raise ValueError("bin_width must be > 0.")
+    if max_preview_rows < 0 or max_preview_rows > 200:
+        raise ValueError("max_preview_rows must be between 0 and 200.")
+
+    csv_file = _resolve_csv_path(csv_path)
+    target = (
+        _resolve_output_file_path(output_path, default_ext=".csv")
+        if output_path
+        else csv_file.with_name(f"{csv_file.stem}.binned_stats.csv")
+    )
+    target_literal = _sql_string_literal(str(target))
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        columns = _list_columns(con, safe_table)
+        _require_columns(columns, [x_field, y_field])
+        x_id = _quote_identifier(x_field)
+        y_id = _quote_identifier(y_field)
+        where_clause = _build_optional_where_clause(where_sql)
+
+        con.execute(
+            f"""
+            COPY (
+                WITH base AS (
+                    SELECT TRY_CAST({x_id} AS DOUBLE) AS __x, TRY_CAST({y_id} AS DOUBLE) AS __y
+                    FROM "{safe_table}"
+                    WHERE TRY_CAST({x_id} AS DOUBLE) IS NOT NULL
+                      AND TRY_CAST({y_id} AS DOUBLE) IS NOT NULL
+                      {where_clause}
+                ),
+                binned AS (
+                    SELECT
+                        FLOOR(__x / {float(bin_width)})::BIGINT AS bin_id,
+                        __x,
+                        __y
+                    FROM base
+                )
+                SELECT
+                    bin_id,
+                    bin_id * {float(bin_width)} AS bin_start,
+                    (bin_id + 1) * {float(bin_width)} AS bin_end,
+                    (bin_id + 0.5) * {float(bin_width)} AS bin_center,
+                    COUNT(*) AS count,
+                    AVG(__y) AS y_mean,
+                    MEDIAN(__y) AS y_median,
+                    STDDEV_SAMP(__y) AS y_std,
+                    MIN(__y) AS y_min,
+                    MAX(__y) AS y_max,
+                    quantile_cont(__y, 0.25) AS y_q25,
+                    quantile_cont(__y, 0.75) AS y_q75
+                FROM binned
+                GROUP BY bin_id
+                ORDER BY bin_id
+            )
+            TO {target_literal}
+            WITH (FORMAT CSV, HEADER true)
+            """
+        )
+        preview_result = con.execute(
+            f"SELECT * FROM read_csv_auto({target_literal}, sample_size=-1, ignore_errors=false) LIMIT {int(max_preview_rows)}"
+        )
+        preview_columns = [d[0] for d in preview_result.description]
+        preview_rows = preview_result.fetchall()
+        row_count = con.execute(
+            f"SELECT COUNT(*) FROM read_csv_auto({target_literal}, sample_size=-1, ignore_errors=false)"
+        ).fetchone()[0]
+
+    return {
+        "success": True,
+        "csv_path": str(csv_file),
+        "output_path": str(target),
+        "x_field": x_field,
+        "y_field": y_field,
+        "bin_width": float(bin_width),
+        "row_count": int(row_count),
+        "columns": preview_columns,
+        "preview_rows": _rows_to_records(preview_columns, preview_rows),
+        "where_sql": where_sql.strip() or None,
+    }
+
+
+@mcp.tool()
+def plot_scatter_with_fit(
+    csv_path: str,
+    x_field: str,
+    y_field: str,
+    output_path: str = "scatter_with_fit.png",
+    table_name: str = "tracks",
+    where_sql: str = "",
+    dpi: int = 300,
+    point_size: float = 2.0,
+    alpha: float = 0.35,
+    title: str | None = None,
+    x_label: str | None = None,
+    y_label: str | None = None,
+    fit_type: str = "linear",
+    show_equation: bool = True,
+    bin_width: float = 0.005,
+    show_errorbar: bool = False,
+    ignore_errors: bool = True,
+) -> dict[str, Any]:
+    """Plot scatter with optional linear fit or binned-mean trend."""
+    if dpi <= 0:
+        raise ValueError("dpi must be > 0.")
+    if point_size <= 0:
+        raise ValueError("point_size must be > 0.")
+    if not (0 <= alpha <= 1):
+        raise ValueError("alpha must be between 0 and 1.")
+    fit_type_normalized = fit_type.strip().lower()
+    if fit_type_normalized not in {"linear", "binned_mean"}:
+        raise ValueError("fit_type must be one of: linear, binned_mean.")
+    if fit_type_normalized == "binned_mean" and bin_width <= 0:
+        raise ValueError("bin_width must be > 0 when fit_type is binned_mean.")
+
+    csv_file = _resolve_csv_path(csv_path)
+    target = _resolve_output_file_path(output_path, default_ext=".png")
+    with duckdb.connect(database=":memory:") as con:
+        safe_table = _create_or_replace_view(con, table_name, str(csv_file), ignore_errors)
+        columns = _list_columns(con, safe_table)
+        _require_columns(columns, [x_field, y_field])
+        x_id = _quote_identifier(x_field)
+        y_id = _quote_identifier(y_field)
+        where_clause = _build_optional_where_clause(where_sql)
+        rows = con.execute(
+            f"""
+            SELECT TRY_CAST({x_id} AS DOUBLE) AS __x, TRY_CAST({y_id} AS DOUBLE) AS __y
+            FROM "{safe_table}"
+            WHERE TRY_CAST({x_id} AS DOUBLE) IS NOT NULL
+              AND TRY_CAST({y_id} AS DOUBLE) IS NOT NULL
+              {where_clause}
+            """
+        ).fetchall()
+    if len(rows) < 2:
+        raise ValueError("At least 2 valid numeric samples are required.")
+    xs = [float(r[0]) for r in rows]
+    ys = [float(r[1]) for r in rows]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    try:
+        ax.scatter(xs, ys, s=point_size, alpha=alpha, label="Samples")
+        slope: float | None = None
+        intercept: float | None = None
+        r2: float | None = None
+        p_value: float | None = None
+        if fit_type_normalized == "linear":
+            fit = scipy_stats.linregress(xs, ys)
+            slope = float(fit.slope)
+            intercept = float(fit.intercept)
+            p_value = float(fit.pvalue)
+            r2 = float(fit.rvalue**2)
+            sorted_pairs = sorted(zip(xs, ys), key=lambda item: item[0])
+            x_line = [p[0] for p in sorted_pairs]
+            y_line = [slope * x + intercept for x in x_line]
+            ax.plot(x_line, y_line, color="red", linewidth=1.8, label="Linear fit")
+            if show_equation:
+                eq = f"y = {slope:.4g}x + {intercept:.4g}\nR² = {r2:.4f}"
+                ax.text(0.02, 0.98, eq, transform=ax.transAxes, va="top", ha="left")
+        else:
+            bin_map: dict[int, list[float]] = {}
+            for x_val, y_val in zip(xs, ys):
+                bid = int((x_val // bin_width))
+                bin_map.setdefault(bid, []).append(y_val)
+            centers = sorted(bin_map.keys())
+            x_centers = [(b + 0.5) * bin_width for b in centers]
+            y_means = [float(sum(bin_map[b]) / len(bin_map[b])) for b in centers]
+            ax.plot(x_centers, y_means, color="red", linewidth=1.8, label="Binned mean")
+            if show_errorbar:
+                y_stds = []
+                for b in centers:
+                    vals = bin_map[b]
+                    y_stds.append(float(scipy_stats.tstd(vals)) if len(vals) > 1 else 0.0)
+                ax.errorbar(x_centers, y_means, yerr=y_stds, fmt="none", ecolor="red", alpha=0.6)
+
+        ax.set_title(title if title is not None else "Scatter with Fit")
+        ax.set_xlabel(x_label if x_label is not None else x_field)
+        ax.set_ylabel(y_label if y_label is not None else y_field)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        fig.savefig(str(target), dpi=int(dpi))
+    finally:
+        plt.close(fig)
+
+    return {
+        "success": True,
+        "output_path": str(target),
+        "fit_type": fit_type_normalized,
+        "slope": slope,
+        "intercept": intercept,
+        "r2": r2,
+        "p_value": p_value,
+        "n": len(rows),
+        "x_field": x_field,
+        "y_field": y_field,
+        "where_sql": where_sql.strip() or None,
     }
 
 

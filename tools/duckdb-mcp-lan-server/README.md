@@ -104,14 +104,18 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 返回推断字段和总行数
 - `query_csv(csv_path, sql, table_name="tracks", max_rows=1000, ignore_errors=False)`
   - 对 CSV 执行 SQL（SQL 中使用 `table_name` 作为表名，`max_rows` 上限 10000）
+- `query_csv_to_csv(csv_path, sql, output_path, table_name="tracks", ignore_errors=True, max_preview_rows=10)`
+  - 对输入 CSV 执行 SQL 并导出结果到新的 CSV，返回输出行数、列名与预览数据
+- `write_rows_to_csv(output_path, columns, rows, overwrite=True)`
+  - 直接将列名与二维行数据写入 CSV 文件，适合把上游计算结果落盘
 - `deduplicate_csv(csv_path, key_columns, output_path=None, table_name="tracks", order_by=None, ignore_errors=False)`
   - 按 key 列去重，输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.dedup.csv`）
 - `filter_csv(csv_path, where_sql, output_path=None, table_name="tracks", ignore_errors=False)`
   - 按过滤条件输出新的 CSV（默认输出到原文件同目录，文件名为 `<原文件名>.filtered.csv`），并返回过滤前后与剔除行数统计
 - `extract_columns_to_csv(csv_path, output_path, columns, where_sql="", order_by="", table_name="tracks", ignore_errors=False)`
   - 从 CSV 提取指定字段并导出新 CSV，支持可选过滤与排序（如按 `fnum, u_time` 排序）
-- `plot_basic(csv_path, chart_type, x_field=None, y_field=None, color_field=None, output_path="plot_basic.png", bins=20, table_name="tracks", ignore_errors=False)`
-  - 生成基础图表：`scatter`、`line`、`histogram`、`box`
+- `plot_basic(csv_path, chart_type, x_field=None, y_field=None, color_field=None, output_path="plot_basic.png", dpi=300, point_size=14.0, alpha=0.75, title=None, x_label=None, y_label=None, bins=20, table_name="tracks", ignore_errors=False)`
+  - 生成基础图表：`scatter`、`line`、`histogram`、`box`，支持论文级分辨率 `dpi`、散点大小 `point_size`、透明度 `alpha` 与自定义标题/坐标轴标签
 - `plot_categorical_scatter(csv_path, x_field, y_field, category_field, output_path="categorical_scatter.png", dpi=1200, figsize=[12, 10], colormap="tab10", point_size=1.0, alpha=0.6, title="Categorical Scatter Plot", x_label=None, y_label=None, table_name="tracks", ignore_errors=False)`
   - 绘制分类散点图：使用离散调色板 + 图例（非连续色带），支持高分辨率 `dpi`
 - `plot_time_series(csv_path, time_field, value_fields, output_path, table_name="tracks", ignore_errors=False)`
@@ -124,6 +128,12 @@ MCP_TRANSPORT=sse MCP_PATH=/sse python server.py
   - 返回分布统计（最小值、最大值、均值、中位数、标准差、四分位数等）
 - `analyze_group_stats(csv_path, group_field, value_fields, stats=None, table_name="tracks", ignore_errors=False)`
   - 按分组字段输出多字段统计结果（支持 `mean/std/count/min/max/sum/median`）
+- `analyze_linear_regression(csv_path, x_field, y_field, table_name="tracks", where_sql="", ignore_errors=True)`
+  - 线性回归分析，直接返回 `slope`、`intercept`、`r2`、`p_value`、`n` 与回归方程
+- `analyze_binned_stats(csv_path, x_field, y_field, bin_width, table_name="tracks", where_sql="", output_path=None, ignore_errors=True, max_preview_rows=10)`
+  - 按 `x_field` 分箱统计 `y_field`，输出每个密度区间的 `count/mean/median/std/min/max/q25/q75`，并可导出为 CSV
+- `plot_scatter_with_fit(csv_path, x_field, y_field, output_path="scatter_with_fit.png", table_name="tracks", where_sql="", dpi=300, point_size=2.0, alpha=0.35, title=None, x_label=None, y_label=None, fit_type="linear", show_equation=True, bin_width=0.005, show_errorbar=False, ignore_errors=True)`
+  - 论文向散点图工具：支持线性拟合线或分箱均值线（可选误差棒），并输出拟合关键指标
 - `duckdb_health()`
   - 返回 `{ ok, duckdbVersion, dbPath, time }`，用于连通性检测（`time` 为 ISO8601）
 - `duckdb_list_tables(includeViews=true)`
