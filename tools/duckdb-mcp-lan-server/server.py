@@ -352,9 +352,20 @@ def _get_table_bboxes(fitz_page: Any) -> list[tuple[float, float, float, float]]
     """Return bounding boxes of all tables on a PyMuPDF page."""
     try:
         finder = fitz_page.find_tables()
-        return [tuple(tbl.bbox) for tbl in finder.tables]  # type: ignore[return-value]
+        return [(float(b[0]), float(b[1]), float(b[2]), float(b[3])) for b in (tbl.bbox for tbl in finder.tables)]
     except Exception:
         return []
+
+
+# PyMuPDF span flag bit positions (see MuPDF source / PyMuPDF docs).
+_FLAG_SUPERSCRIPT = 1 << 0  # bit 0
+_FLAG_ITALIC = 1 << 1       # bit 1
+_FLAG_BOLD = 1 << 4          # bit 4
+
+
+def _int_to_hex_color(color_int: int) -> str:
+    """Convert a PyMuPDF sRGB integer (0xRRGGBB) to a CSS hex color string."""
+    return f"#{(color_int >> 16) & 0xFF:02X}{(color_int >> 8) & 0xFF:02X}{color_int & 0xFF:02X}"
 
 
 def _create_or_replace_view(
@@ -2575,12 +2586,10 @@ def pdf_extract_element_styles(
                 spans_out: list[dict[str, Any]] = []
                 for span in line.get("spans", []):
                     flags = int(span.get("flags", 0))
-                    # PyMuPDF flag bits: 0=superscript, 1=italic, 4=bold
-                    is_superscript = bool(flags & 0b00001)
-                    is_italic = bool(flags & 0b00010)
-                    is_bold = bool(flags & 0b10000)
-                    color_int = int(span.get("color", 0))
-                    color_hex = f"#{(color_int >> 16) & 0xFF:02X}{(color_int >> 8) & 0xFF:02X}{color_int & 0xFF:02X}"
+                    is_superscript = bool(flags & _FLAG_SUPERSCRIPT)
+                    is_italic = bool(flags & _FLAG_ITALIC)
+                    is_bold = bool(flags & _FLAG_BOLD)
+                    color_hex = _int_to_hex_color(int(span.get("color", 0)))
                     spans_out.append(
                         {
                             "text": span.get("text", ""),
