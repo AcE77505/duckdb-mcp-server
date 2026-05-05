@@ -2896,6 +2896,148 @@ def pdf_extract_element_styles(
     }
 
 
+def _resolve_mupdf_path(path: str) -> Path:
+    resolved = _resolve_workspace_path(path)
+    if not resolved.exists() or not resolved.is_file():
+        raise ValueError(f"File not found: {resolved}")
+    return resolved
+
+
+@mcp.tool()
+def mupdf_get_capabilities() -> dict[str, Any]:
+    """返回当前服务可用的 PyMuPDF / PyMuPDF4LLM / PyMuPDF Pro 能力清单。"""
+    modules: dict[str, Any] = {
+        "pymupdf": {"available": fitz is not None},
+        "pymupdf4llm": {"available": False},
+        "pymupdf_pro": {"available": False},
+    }
+    if fitz is not None:
+        modules["pymupdf"]["version"] = getattr(fitz, "VersionBind", None)
+
+    try:
+        import pymupdf4llm  # type: ignore[import-not-found]
+
+        modules["pymupdf4llm"] = {
+            "available": True,
+            "version": getattr(pymupdf4llm, "__version__", None),
+        }
+    except Exception:
+        pass
+
+    try:
+        import pymupdf.pro  # type: ignore[import-not-found]
+
+        modules["pymupdf_pro"] = {"available": True}
+    except Exception:
+        pass
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "modules": modules,
+        "core_examples": [
+            "open/read/write",
+            "extract text/html/xml/json",
+            "find tables / render pixmap / extract images",
+            "annotation / redaction / forms / links / toc / metadata",
+            "merge/split/reorder / encryption save",
+        ],
+    }
+
+
+@mcp.tool()
+def mupdf_run_python(code: str) -> dict[str, Any]:
+    """执行 PyMuPDF Python 代码片段（受限沙箱），用于覆盖全量 API 能力。"""
+    if fitz is None:
+        raise ValueError("PyMuPDF is required. Install pymupdf>=1.27.2.")
+    if not code or not code.strip():
+        raise ValueError("code cannot be empty.")
+
+    safe_builtins: dict[str, Any] = {
+        "abs": abs,
+        "all": all,
+        "any": any,
+        "bool": bool,
+        "dict": dict,
+        "enumerate": enumerate,
+        "float": float,
+        "int": int,
+        "len": len,
+        "list": list,
+        "max": max,
+        "min": min,
+        "print": print,
+        "range": range,
+        "round": round,
+        "set": set,
+        "sorted": sorted,
+        "str": str,
+        "sum": sum,
+        "tuple": tuple,
+        "zip": zip,
+    }
+
+    def _open_workspace_doc(path: str) -> Any:
+        resolved = _resolve_mupdf_path(path)
+        return fitz.open(str(resolved))
+
+    output: list[str] = []
+
+    def _capture_print(*args: Any, **kwargs: Any) -> None:
+        sep = str(kwargs.get("sep", " "))
+        end = str(kwargs.get("end", "\n"))
+        output.append(sep.join(str(a) for a in args) + end)
+
+    safe_builtins["print"] = _capture_print
+    local_ns: dict[str, Any] = {}
+    global_ns: dict[str, Any] = {
+        "__builtins__": safe_builtins,
+        "pymupdf": fitz,
+        "fitz": fitz,
+        "workspace_dir": str(WORKSPACE_DIR),
+        "open_doc": _open_workspace_doc,
+        "Path": Path,
+        "result": None,
+    }
+    try:
+        exec(code, global_ns, local_ns)
+    except Exception as exc:
+        raise ValueError(f"mupdf_run_python failed: {exc}") from exc
+
+    result_obj = local_ns.get("result", global_ns.get("result"))
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "stdout": "".join(output),
+        "result": _json_compatible_value(result_obj),
+    }
+
+
+@mcp.tool()
+def mupdf4llm_convert(path: str, output: str = "markdown") -> dict[str, Any]:
+    """调用 PyMuPDF4LLM 进行 LLM 友好抽取（markdown/json/text）。"""
+    resolved = _resolve_mupdf_path(path)
+    mode = output.strip().lower()
+    if mode not in {"markdown", "json", "text"}:
+        raise ValueError("output must be one of: markdown, json, text")
+    try:
+        import pymupdf4llm  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise ValueError("pymupdf4llm is required. Install with: pip install pymupdf4llm") from exc
+
+    if mode == "markdown":
+        content = pymupdf4llm.to_markdown(str(resolved))
+    elif mode == "json":
+        content = pymupdf4llm.to_json(str(resolved))
+    else:
+        content = pymupdf4llm.to_text(str(resolved))
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "output": mode,
+        "content": content,
+    }
+
+
 if __name__ == "__main__":
     os.chdir(WORKSPACE_DIR)
     raw_transport = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
