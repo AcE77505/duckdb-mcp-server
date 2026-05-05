@@ -2,6 +2,7 @@ duckdb>=1.1.0
 mcp[cli]>=1.0.0
 pypdf>=5.4.0
 pymupdf>=1.27.2
+pymupdf4llm>=0.0.27
 rapidocr-onnxruntime>=1.4.4; python_version < "3.13"
 matplotlib>=3.9.2
 scipy>=1.14.1
