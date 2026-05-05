@@ -2474,67 +2474,19 @@ def pdf_identify_element_types(
     pdf_path: str,
     page: int = 1,
 ) -> dict[str, Any]:
-    """识别 PDF 页面中各元素的类型（text/image/table/list/header/footer）。"""
+    """后备方法：基于 pypdf 的粗粒度元素类型识别（不依赖 PyMuPDF）。"""
     if page <= 0:
         raise ValueError("page must be > 0.")
-
-    resolved, doc = _open_fitz_doc(pdf_path)
-    try:
-        total_pages = doc.page_count
-        if page > total_pages:
-            raise ValueError(f"page {page} exceeds total pages {total_pages}.")
-        fitz_page = doc[page - 1]
-        page_height = float(fitz_page.rect.height)
-
-        text_dict = fitz_page.get_text("dict")
-        all_sizes: list[float] = []
-        for block in text_dict.get("blocks", []):
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    all_sizes.append(float(span.get("size", 0.0)))
-        avg_size = (sum(all_sizes) / len(all_sizes)) if all_sizes else 0.0
-        table_bboxes = _get_table_bboxes(fitz_page)
-        elements: list[dict[str, Any]] = []
-        for idx, block in enumerate(text_dict.get("blocks", [])):
-            elem_type = _classify_block_type(block, page_height, table_bboxes)
-            block_text = _extract_block_text(block)
-            max_font = 0.0
-            has_bold = False
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    size = float(span.get("size", 0.0))
-                    max_font = max(max_font, size)
-                    has_bold = has_bold or bool(int(span.get("flags", 0)) & _FLAG_BOLD)
-            if elem_type == "equation" and not _looks_like_equation(block_text):
-                elem_type = "text"
-            if elem_type in {"text", "list"} and (_HEADING_NUMBERED_RE.match(block_text) or has_bold) and max_font >= avg_size + 0.6:
-                elem_type = "heading1"
-            elif elem_type in {"text", "list"} and (_HEADING_NUMBERED_RE.match(block_text) or has_bold) and max_font >= avg_size:
-                elem_type = "heading2"
-            elif elem_type in {"text", "list"} and _HEADING_NUMBERED_RE.match(block_text):
-                elem_type = "heading3"
-            bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
-            elements.append(
-                {
-                    "index": idx,
-                    "type": elem_type,
-                    "text": block_text,
-                    "font_size": round(max_font, 2),
-                    "is_bold": has_bold,
-                    "bbox": [round(v, 2) for v in bbox],
-                }
-            )
-    finally:
-        doc.close()
-
-    return {
-        "workspace": str(WORKSPACE_DIR),
-        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
-        "page": page,
-        "page_count": total_pages,
-        "element_count": len(elements),
-        "elements": elements,
-    }
+    resolved, reader = _read_pdf(pdf_path)
+    if page > len(reader.pages):
+        raise ValueError(f"page {page} exceeds total pages {len(reader.pages)}.")
+    text = reader.pages[page - 1].extract_text() or ""
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    elements=[]
+    for idx,b in enumerate(blocks):
+        t='equation' if _looks_like_equation(b) else 'text'
+        elements.append({'index':idx,'type':t,'text':b,'font_size':None,'is_bold':None,'bbox':None})
+    return {'workspace':str(WORKSPACE_DIR),'path':resolved.relative_to(WORKSPACE_DIR).as_posix(),'page':page,'page_count':len(reader.pages),'method':'fallback-pypdf','element_count':len(elements),'elements':elements}
 
 
 @mcp.tool()
@@ -2543,94 +2495,17 @@ def pdf_extract_element_coordinates(
     page: int = 1,
     element_types: list[str] | None = None,
 ) -> dict[str, Any]:
-    """提取 PDF 页面中各元素的坐标（x0/y0 左上角，x1/y1 右下角，单位 pt）。"""
+    """后备方法：pypdf 不提供可靠坐标，返回文本块与阅读顺序（无几何坐标）。"""
     if page <= 0:
         raise ValueError("page must be > 0.")
-
-    _VALID_TYPES = {"text", "image", "table", "list", "header", "footer", "caption", "equation", "reference"}
-    filter_types: set[str] | None = None
-    if element_types:
-        unknown = [t for t in element_types if t not in _VALID_TYPES]
-        if unknown:
-            raise ValueError(
-                f"Unknown element types: {unknown}. Valid: {sorted(_VALID_TYPES)}"
-            )
-        filter_types = set(element_types)
-
-    resolved, doc = _open_fitz_doc(pdf_path)
-    try:
-        total_pages = doc.page_count
-        if page > total_pages:
-            raise ValueError(f"page {page} exceeds total pages {total_pages}.")
-        fitz_page = doc[page - 1]
-        page_rect = fitz_page.rect
-        page_height = float(page_rect.height)
-        page_width = float(page_rect.width)
-
-        table_bboxes = _get_table_bboxes(fitz_page)
-        text_dict = fitz_page.get_text("dict")
-        elements: list[dict[str, Any]] = []
-        for idx, block in enumerate(text_dict.get("blocks", [])):
-            elem_type = _classify_block_type(block, page_height, table_bboxes)
-            if filter_types and elem_type not in filter_types:
-                continue
-            bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
-            x0, y0, x1, y1 = (float(v) for v in bbox)
-            elements.append(
-                {
-                    "index": idx,
-                    "type": elem_type,
-                    "x0": round(x0, 2),
-                    "y0": round(y0, 2),
-                    "x1": round(x1, 2),
-                    "y1": round(y1, 2),
-                    "width": round(x1 - x0, 2),
-                    "height": round(y1 - y0, 2),
-                }
-            )
-        for order, elem in enumerate(sorted(elements, key=lambda e: (e["y0"], e["x0"])), start=1):
-            elem["reading_order"] = order
-    finally:
-        doc.close()
-
-    relationships: list[dict[str, Any]] = []
-    sorted_elements = sorted(elements, key=lambda e: (e["y0"], e["x0"]))
-    for i in range(len(sorted_elements) - 1):
-        cur = sorted_elements[i]
-        nxt = sorted_elements[i + 1]
-        if abs(cur["y0"] - nxt["y0"]) <= 2:
-            relation = "same_row"
-            distance = round(abs(nxt["x0"] - cur["x1"]), 2)
-        elif cur["x1"] <= nxt["x0"] and abs(cur["y0"] - nxt["y0"]) < max(cur["height"], nxt["height"]) * 0.8:
-            relation = "left_of"
-            distance = round(nxt["x0"] - cur["x1"], 2)
-        elif nxt["x1"] <= cur["x0"] and abs(cur["y0"] - nxt["y0"]) < max(cur["height"], nxt["height"]) * 0.8:
-            relation = "right_of"
-            distance = round(cur["x0"] - nxt["x1"], 2)
-        elif cur["y1"] <= nxt["y0"]:
-            relation = "above"
-            distance = round(nxt["y0"] - cur["y1"], 2)
-        else:
-            relation = "overlap"
-            distance = 0.0
-        relationships.append({"from": cur["index"], "to": nxt["index"], "relation": relation, "distance": distance})
-
-    return {
-        "workspace": str(WORKSPACE_DIR),
-        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
-        "page": page,
-        "page_count": total_pages,
-        "page_width": round(page_width, 2),
-        "page_height": round(page_height, 2),
-        "coordinate_unit": "pt",
-        "page_layout": {
-            "columns": 2 if page_width > 500 else 1,
-            "read_order": "top-to-bottom, left-to-right",
-        },
-        "relationships": relationships,
-        "element_count": len(elements),
-        "elements": elements,
-    }
+    base = pdf_identify_element_types(pdf_path=pdf_path, page=page)
+    elems=[]
+    for i,e in enumerate(base['elements'],start=1):
+        if element_types and e['type'] not in set(element_types):
+            continue
+        elems.append({'index':e['index'],'type':e['type'],'x0':None,'y0':None,'x1':None,'y1':None,'width':None,'height':None,'reading_order':i})
+    base.update({'coordinate_unit':None,'page_layout':{'read_order':'top-to-bottom (fallback)'},'relationships':[],'element_count':len(elems),'elements':elems,'method':'fallback-pypdf'})
+    return base
 
 
 @mcp.tool()
@@ -2638,73 +2513,24 @@ def pdf_read_tables(
     pdf_path: str,
     page: int = 1,
 ) -> dict[str, Any]:
-    """识别并读取 PDF 页面中的表格，以二维数组形式返回每张表格的内容。"""
+    """后备方法：不依赖 PyMuPDF 的表格启发式识别（基于文本对齐）。"""
     if page <= 0:
         raise ValueError("page must be > 0.")
-
-    resolved, doc = _open_fitz_doc(pdf_path)
-    try:
-        total_pages = doc.page_count
-        if page > total_pages:
-            raise ValueError(f"page {page} exceeds total pages {total_pages}.")
-        fitz_page = doc[page - 1]
-
-        tables_out: list[dict[str, Any]] = []
-        diagnostics: list[str] = []
-        try:
-            finder = fitz_page.find_tables()
-            for tbl_idx, tbl in enumerate(finder.tables):
-                data = tbl.extract()
-                rows_cleaned = [
-                    [cell if cell is not None else "" for cell in row] for row in data
-                ]
-                tables_out.append(
-                    {
-                        "table_index": tbl_idx,
-                        "bbox": [round(v, 2) for v in tbl.bbox],
-                        "row_count": len(rows_cleaned),
-                        "col_count": max((len(r) for r in rows_cleaned), default=0),
-                        "headers": rows_cleaned[0] if rows_cleaned else [],
-                        "rows": rows_cleaned[1:] if len(rows_cleaned) > 1 else [],
-                        "data": rows_cleaned,
-                        "source": "detector",
-                    }
-                )
-            if not tables_out:
-                diagnostics.append("No bordered table detected by find_tables(); trying text-alignment inference.")
-                inferred_tables = _infer_text_tables_from_alignment(fitz_page)
-                if not inferred_tables:
-                    diagnostics.append("Text-alignment inference empty; trying word-grid inference.")
-                    inferred_tables = _infer_text_tables_from_words(fitz_page)
-                for tbl_idx, tbl in enumerate(inferred_tables):
-                    tables_out.append(
-                        {
-                            "table_index": tbl_idx,
-                            "bbox": [round(v, 2) for v in tbl["bbox"]],
-                            "row_count": tbl["row_count"],
-                            "col_count": tbl["col_count"],
-                            "headers": tbl["data"][0] if tbl["data"] else [],
-                            "rows": tbl["data"][1:] if len(tbl["data"]) > 1 else [],
-                            "data": tbl["data"],
-                            "source": tbl["source"],
-                        }
-                    )
-                if not inferred_tables:
-                    diagnostics.append("No aligned multi-column text pattern found on this page.")
-        except Exception as exc:
-            raise ValueError(f"Table detection failed: {exc}") from exc
-    finally:
-        doc.close()
-
-    return {
-        "workspace": str(WORKSPACE_DIR),
-        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
-        "page": page,
-        "page_count": total_pages,
-        "table_count": len(tables_out),
-        "diagnostics": diagnostics,
-        "tables": tables_out,
-    }
+    resolved, reader = _read_pdf(pdf_path)
+    if page > len(reader.pages):
+        raise ValueError(f"page {page} exceeds total pages {len(reader.pages)}.")
+    text = reader.pages[page - 1].extract_text() or ""
+    rows=[r for r in (ln.strip() for ln in text.splitlines()) if r]
+    table_rows=[]
+    for r in rows:
+        if re.search(r"\s{2,}|	", r):
+            cells=[c for c in re.split(r"	|\s{2,}",r) if c]
+            if len(cells)>=2:
+                table_rows.append(cells)
+    tables=[]
+    if table_rows:
+        tables.append({'table_index':0,'bbox':None,'row_count':len(table_rows),'col_count':max(len(r) for r in table_rows),'headers':table_rows[0],'rows':table_rows[1:],'data':table_rows,'source':'fallback-text-split'})
+    return {'workspace':str(WORKSPACE_DIR),'path':resolved.relative_to(WORKSPACE_DIR).as_posix(),'page':page,'page_count':len(reader.pages),'method':'fallback-pypdf','table_count':len(tables),'diagnostics':['Fallback parser without PyMuPDF; accuracy may be limited.'],'tables':tables}
 
 
 @mcp.tool()
@@ -2712,75 +2538,19 @@ def pdf_identify_formulas(
     pdf_path: str,
     page: int = 1,
 ) -> dict[str, Any]:
-    """识别 PDF 页面中包含数学公式或数学符号的文本片段（不使用 OCR）。"""
+    """后备方法：基于 pypdf 文本的公式识别。"""
     if page <= 0:
         raise ValueError("page must be > 0.")
-
-    resolved, doc = _open_fitz_doc(pdf_path)
-    try:
-        total_pages = doc.page_count
-        if page > total_pages:
-            raise ValueError(f"page {page} exceeds total pages {total_pages}.")
-        fitz_page = doc[page - 1]
-        text_dict = fitz_page.get_text("dict")
-
-        fragments: list[dict[str, Any]] = []
-        for block_idx, block in enumerate(text_dict.get("blocks", [])):
-            if block.get("type", 0) != 0:
-                continue
-            block_text = _extract_block_text(block)
-            if not _looks_like_equation(block_text):
-                continue
-            if "©" in block_text and len(block_text) < 8:
-                continue
-            if "=" not in block_text and len(re.findall(r"[+\-*/^∑∫√≤≥]", block_text)) < 2:
-                continue
-            math_symbol_count = sum(1 for ch in block_text if _is_math_char(ch))
-            op_count = len(re.findall(r"[=+\-*/^<>≤≥∑∫√]", block_text))
-            has_equals = "=" in block_text
-            confidence = min(0.99, round(0.35 + (0.22 if has_equals else 0.0) + 0.08 * math_symbol_count + 0.07 * op_count, 2))
-            fragments.append(
-                {
-                    "block_index": block_idx,
-                    "text": block_text,
-                    "bbox": [round(v, 2) for v in block.get("bbox", (0.0, 0.0, 0.0, 0.0))],
-                    "confidence": confidence,
-                    "type": "display" if len(block.get("lines", [])) > 1 else "inline",
-                }
-            )
-        formulas: list[dict[str, Any]] = []
-        fragments_sorted = sorted(fragments, key=lambda f: (f["bbox"][1], f["bbox"][0]))
-        for frag in fragments_sorted:
-            if not formulas:
-                formulas.append(frag)
-                continue
-            last = formulas[-1]
-            same_line = abs(frag["bbox"][1] - last["bbox"][1]) <= 8
-            vertical_gap = frag["bbox"][1] - last["bbox"][3]
-            near_block = 0 <= vertical_gap <= 4
-            if same_line or (near_block and len(frag["text"]) < 40 and len(last["text"]) < 120):
-                last["text"] = f"{last['text']} {frag['text']}".strip()
-                last["bbox"] = [
-                    min(last["bbox"][0], frag["bbox"][0]),
-                    min(last["bbox"][1], frag["bbox"][1]),
-                    max(last["bbox"][2], frag["bbox"][2]),
-                    max(last["bbox"][3], frag["bbox"][3]),
-                ]
-                last["confidence"] = round(max(last["confidence"], frag["confidence"]), 2)
-                last["type"] = "display" if (last["type"] == "display" or frag["type"] == "display") else "inline"
-            else:
-                formulas.append(frag)
-    finally:
-        doc.close()
-
-    return {
-        "workspace": str(WORKSPACE_DIR),
-        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
-        "page": page,
-        "page_count": total_pages,
-        "formula_count": len(formulas),
-        "formulas": formulas,
-    }
+    resolved, reader = _read_pdf(pdf_path)
+    if page > len(reader.pages):
+        raise ValueError(f"page {page} exceeds total pages {len(reader.pages)}.")
+    text = reader.pages[page - 1].extract_text() or ""
+    formulas=[]
+    for i,line in enumerate(text.splitlines()):
+        line=line.strip()
+        if line and _looks_like_equation(line):
+            formulas.append({'block_index':i,'text':line,'bbox':None,'confidence':0.45,'type':'inline'})
+    return {'workspace':str(WORKSPACE_DIR),'path':resolved.relative_to(WORKSPACE_DIR).as_posix(),'page':page,'page_count':len(reader.pages),'method':'fallback-pypdf','formula_count':len(formulas),'formulas':formulas}
 
 
 @mcp.tool()
@@ -2789,120 +2559,19 @@ def pdf_extract_element_styles(
     page: int = 1,
     mode: str = "detailed",
 ) -> dict[str, Any]:
-    """提取 PDF 页面中各文本块的样式（字号、字体、粗体/斜体、颜色、行距）。"""
+    """后备方法：pypdf 不含稳定样式信息，返回文本级摘要。"""
     if page <= 0:
         raise ValueError("page must be > 0.")
     if mode not in {"detailed", "summary"}:
         raise ValueError("mode must be 'detailed' or 'summary'.")
-
-    resolved, doc = _open_fitz_doc(pdf_path)
-    try:
-        total_pages = doc.page_count
-        if page > total_pages:
-            raise ValueError(f"page {page} exceeds total pages {total_pages}.")
-        fitz_page = doc[page - 1]
-        text_dict = fitz_page.get_text("dict")
-
-        elements: list[dict[str, Any]] = []
-        fonts_used: set[str] = set()
-        font_sizes: set[float] = set()
-        font_size_counts: Counter[float] = Counter()
-        colors_used: set[str] = set()
-        line_spacings: list[float] = []
-        for block_idx, block in enumerate(text_dict.get("blocks", [])):
-            if block.get("type", 0) != 0:
-                continue
-            block_bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
-            lines = block.get("lines", [])
-            block_lines_out: list[dict[str, Any]] = []
-            prev_line_top: float | None = None
-            for line_idx, line in enumerate(lines):
-                line_bbox = line.get("bbox", (0.0, 0.0, 0.0, 0.0))
-                line_top = float(line_bbox[1])
-                line_spacing: float | None = None
-                if prev_line_top is not None:
-                    line_spacing = round(line_top - prev_line_top, 2)
-                    line_spacings.append(line_spacing)
-                prev_line_top = line_top
-
-                spans_out: list[dict[str, Any]] = []
-                for span in line.get("spans", []):
-                    flags = int(span.get("flags", 0))
-                    is_superscript = bool(flags & _FLAG_SUPERSCRIPT)
-                    is_italic = bool(flags & _FLAG_ITALIC)
-                    is_bold = bool(flags & _FLAG_BOLD)
-                    color_hex = _int_to_hex_color(int(span.get("color", 0)))
-                    fonts_used.add(span.get("font", ""))
-                    font_sizes.add(round(float(span.get("size", 0.0)), 2))
-                    font_size_counts[round(float(span.get("size", 0.0)), 2)] += 1
-                    colors_used.add(color_hex)
-                    spans_out.append(
-                        {
-                            "text": span.get("text", ""),
-                            "font": span.get("font", ""),
-                            "size": round(float(span.get("size", 0.0)), 2),
-                            "is_bold": is_bold,
-                            "is_italic": is_italic,
-                            "is_superscript": is_superscript,
-                            "color": color_hex,
-                            "bbox": [
-                                round(v, 2)
-                                for v in span.get("bbox", (0.0, 0.0, 0.0, 0.0))
-                            ],
-                        }
-                    )
-
-                block_lines_out.append(
-                    {
-                        "line_index": line_idx,
-                        "line_spacing_from_prev": line_spacing,
-                        "bbox": [round(v, 2) for v in line_bbox],
-                        "spans": spans_out,
-                    }
-                )
-
-            elements.append(
-                {
-                    "block_index": block_idx,
-                    "bbox": [round(v, 2) for v in block_bbox],
-                    "line_count": len(lines),
-                    "lines": block_lines_out,
-                }
-            )
-    finally:
-        doc.close()
-
-    summary = {
-        "fonts_used": sorted(f for f in fonts_used if f),
-        "font_sizes": sorted(font_sizes),
-        "font_size_counts": dict(sorted(font_size_counts.items(), key=lambda it: it[0])),
-        "colors_used": sorted(colors_used),
-        "line_spacing_stats": {
-            "count": len(line_spacings),
-            "avg": round(sum(line_spacings) / len(line_spacings), 2) if line_spacings else None,
-            "min": min(line_spacings) if line_spacings else None,
-            "max": max(line_spacings) if line_spacings else None,
-        },
-    }
-    return {
-        "workspace": str(WORKSPACE_DIR),
-        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
-        "page": page,
-        "page_count": total_pages,
-        "mode": mode,
-        "summary": summary,
-        "block_count": len(elements),
-        "elements": elements if mode == "detailed" else [],
-    }
-
-
-def _resolve_mupdf_path(path: str) -> Path:
-    resolved = _resolve_workspace_path(path)
-    if not resolved.exists() or not resolved.is_file():
-        raise ValueError(f"File not found: {resolved}")
-    return resolved
-
-
+    resolved, reader = _read_pdf(pdf_path)
+    if page > len(reader.pages):
+        raise ValueError(f"page {page} exceeds total pages {len(reader.pages)}.")
+    text = reader.pages[page - 1].extract_text() or ""
+    lines=[ln for ln in text.splitlines() if ln.strip()]
+    elements=[{'block_index':i,'bbox':None,'line_count':1,'lines':[{'line_index':0,'line_spacing_from_prev':None,'bbox':None,'spans':[{'text':ln,'font':None,'size':None,'is_bold':None,'is_italic':None,'is_superscript':None,'color':None,'bbox':None}]}]} for i,ln in enumerate(lines)]
+    summary={'fonts_used':[],'font_sizes':[],'font_size_counts':{},'colors_used':[],'line_spacing_stats':{'count':0,'avg':None,'min':None,'max':None}}
+    return {'workspace':str(WORKSPACE_DIR),'path':resolved.relative_to(WORKSPACE_DIR).as_posix(),'page':page,'page_count':len(reader.pages),'mode':mode,'method':'fallback-pypdf','summary':summary,'block_count':len(elements),'elements':elements if mode=='detailed' else []}
 
 
 @mcp.tool()
