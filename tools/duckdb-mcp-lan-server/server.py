@@ -3040,7 +3040,7 @@ def mupdf_run_python(code: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def mupdf4llm_convert(path: str, output: str = "markdown") -> dict[str, Any]:
+def mupdf_4llm_convert(path: str, output: str = "markdown") -> dict[str, Any]:
     """调用 PyMuPDF4LLM 进行 LLM 友好抽取（markdown/json/text）。"""
     resolved = _resolve_mupdf_path(path)
     mode = output.strip().lower()
