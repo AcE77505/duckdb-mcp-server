@@ -1,6 +1,7 @@
 import os
 import re
 import json
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -295,6 +296,10 @@ _MATH_FONT_RE = re.compile(
 
 # Pattern for numbered / bulleted list items.
 _NUMBERED_LIST_RE = re.compile(r"^\s*(\d+[.)]\s|[a-zA-Z][.)]\s|[•·▪▸◦‣⁃➢➣➤])")
+_CAPTION_RE = re.compile(r"^\s*(figure|fig\.?|table)\s*[\.:]?\s*\d+", re.IGNORECASE)
+_REFERENCE_RE = re.compile(r"^\s*(\[\d+\]|\d+\.)\s+\S+")
+_EQUATION_INLINE_RE = re.compile(r"[A-Za-z]\s*=\s*[\w(]")
+_HEADING_NUMBERED_RE = re.compile(r"^\s*\d+(\.\d+){0,2}\s+[A-Z]")
 
 # Fraction of page height treated as header / footer margin.
 _HEADER_FOOTER_MARGIN = 0.08
@@ -310,6 +315,31 @@ def _is_math_char(ch: str) -> bool:
 
 def _contains_math(text: str) -> bool:
     return any(_is_math_char(ch) for ch in text)
+
+
+def _extract_block_text(block: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for line in block.get("lines", []):
+        for span in line.get("spans", []):
+            text = str(span.get("text", "")).strip()
+            if text:
+                parts.append(text)
+    return " ".join(parts).strip()
+
+
+def _looks_like_equation(text: str) -> bool:
+    if not text:
+        return False
+    word_count = len(re.findall(r"\b\w+\b", text))
+    if word_count > 20 and not _contains_math(text):
+        return False
+    if text.count("=") >= 1 and (_contains_math(text) or _EQUATION_INLINE_RE.search(text)):
+        return True
+    symbol_hits = sum(1 for ch in text if _is_math_char(ch))
+    operator_hits = len(re.findall(r"[=+\-*/^<>≤≥∑∫√]", text))
+    if symbol_hits >= 2 and word_count <= 16:
+        return True
+    return operator_hits >= 3 and word_count <= 16
 
 
 def _classify_block_type(
@@ -336,8 +366,16 @@ def _classify_block_type(
     # Position-based header / footer detection.
     if y1 <= page_height * _HEADER_FOOTER_MARGIN:
         return "header"
-    if y0 >= page_height * (1.0 - _HEADER_FOOTER_MARGIN):
+    if y0 >= page_height * 0.88 or y0 >= 700.0:
         return "footer"
+
+    block_text = _extract_block_text(block)
+    if _CAPTION_RE.match(block_text) and len(block_text) <= 140:
+        return "caption"
+    if _REFERENCE_RE.match(block_text):
+        return "reference"
+    if _looks_like_equation(block_text):
+        return "equation"
 
     # Numbered / bulleted list detection from the first span of the first line.
     for line in block.get("lines", [])[:1]:
@@ -355,6 +393,104 @@ def _get_table_bboxes(fitz_page: Any) -> list[tuple[float, float, float, float]]
         return [(float(b[0]), float(b[1]), float(b[2]), float(b[3])) for b in (tbl.bbox for tbl in finder.tables)]
     except Exception:
         return []
+
+
+def _infer_text_tables_from_alignment(fitz_page: Any) -> list[dict[str, Any]]:
+    """Infer borderless tables by grouping multi-column aligned text lines."""
+    text_dict = fitz_page.get_text("dict")
+    candidate_rows: list[dict[str, Any]] = []
+    for block in text_dict.get("blocks", []):
+        if block.get("type", 0) != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = [s for s in line.get("spans", []) if str(s.get("text", "")).strip()]
+            if len(spans) < 3:
+                continue
+            spans_sorted = sorted(spans, key=lambda s: float(s.get("bbox", [0])[0]))
+            x_positions = [round(float(s.get("bbox", [0, 0, 0, 0])[0]), 1) for s in spans_sorted]
+            candidate_rows.append(
+                {
+                    "cells": [str(s.get("text", "")).strip() for s in spans_sorted],
+                    "x_positions": x_positions,
+                    "bbox": line.get("bbox", (0.0, 0.0, 0.0, 0.0)),
+                }
+            )
+    grouped: dict[tuple[float, ...], list[dict[str, Any]]] = {}
+    for row in candidate_rows:
+        key = tuple(row["x_positions"])
+        grouped.setdefault(key, []).append(row)
+
+    tables: list[dict[str, Any]] = []
+    for key, rows in grouped.items():
+        if len(rows) < 3:
+            continue
+        rows = sorted(rows, key=lambda r: float(r["bbox"][1]))
+        x0 = min(float(r["bbox"][0]) for r in rows)
+        y0 = min(float(r["bbox"][1]) for r in rows)
+        x1 = max(float(r["bbox"][2]) for r in rows)
+        y1 = max(float(r["bbox"][3]) for r in rows)
+        table_rows = [r["cells"] for r in rows]
+        tables.append(
+            {
+                "bbox": [x0, y0, x1, y1],
+                "row_count": len(table_rows),
+                "col_count": len(key),
+                "data": table_rows,
+                "source": "text-alignment",
+            }
+        )
+    return tables
+
+
+def _infer_text_tables_from_words(fitz_page: Any) -> list[dict[str, Any]]:
+    """Infer borderless tables from word coordinates (robust when lines are merged)."""
+    words = fitz_page.get_text("words")
+    if not words:
+        return []
+    rows_map: dict[float, list[tuple[float, float, float, float, str]]] = {}
+    for w in words:
+        x0, y0, x1, y1, text = float(w[0]), float(w[1]), float(w[2]), float(w[3]), str(w[4]).strip()
+        if not text:
+            continue
+        row_key = round((y0 + y1) / 2, 1)
+        rows_map.setdefault(row_key, []).append((x0, y0, x1, y1, text))
+    row_items = sorted(rows_map.items(), key=lambda it: it[0])
+    candidate_rows: list[dict[str, Any]] = []
+    for _, row_words in row_items:
+        row_words.sort(key=lambda it: it[0])
+        if len(row_words) < 4:
+            continue
+        max_gap = max((row_words[i + 1][0] - row_words[i][2]) for i in range(len(row_words) - 1))
+        if max_gap < 12:
+            continue
+        cells = [w[4] for w in row_words]
+        xs = [round(w[0], 1) for w in row_words]
+        bbox = (min(w[0] for w in row_words), min(w[1] for w in row_words), max(w[2] for w in row_words), max(w[3] for w in row_words))
+        candidate_rows.append({"cells": cells, "x_positions": xs, "bbox": bbox})
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in candidate_rows:
+        grouped.setdefault(len(row["cells"]), []).append(row)
+    tables: list[dict[str, Any]] = []
+    for col_count, rows in grouped.items():
+        if col_count < 4 or len(rows) < 3:
+            continue
+        # keep compact row groups only, avoid absorbing full-paragraph prose
+        rows = sorted(rows, key=lambda r: float(r["bbox"][1]))
+        compact_rows: list[dict[str, Any]] = [rows[0]]
+        for row in rows[1:]:
+            if float(row["bbox"][1]) - float(compact_rows[-1]["bbox"][3]) <= 18:
+                compact_rows.append(row)
+        if len(compact_rows) < 3:
+            continue
+        x0 = min(float(r["bbox"][0]) for r in rows)
+        y0 = min(float(r["bbox"][1]) for r in rows)
+        x1 = max(float(r["bbox"][2]) for r in rows)
+        y1 = max(float(r["bbox"][3]) for r in rows)
+        text_density = sum(len(" ".join(r["cells"])) for r in compact_rows) / max(1.0, (x1 - x0) * (y1 - y0))
+        if text_density > 0.08:
+            continue
+        tables.append({"bbox": [x0, y0, x1, y1], "row_count": len(compact_rows), "col_count": col_count, "data": [r["cells"] for r in compact_rows], "source": "word-grid"})
+    return tables
 
 
 # PyMuPDF span flag bit positions (see MuPDF source / PyMuPDF docs).
@@ -2350,16 +2486,41 @@ def pdf_identify_element_types(
         fitz_page = doc[page - 1]
         page_height = float(fitz_page.rect.height)
 
-        table_bboxes = _get_table_bboxes(fitz_page)
         text_dict = fitz_page.get_text("dict")
+        all_sizes: list[float] = []
+        for block in text_dict.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    all_sizes.append(float(span.get("size", 0.0)))
+        avg_size = (sum(all_sizes) / len(all_sizes)) if all_sizes else 0.0
+        table_bboxes = _get_table_bboxes(fitz_page)
         elements: list[dict[str, Any]] = []
         for idx, block in enumerate(text_dict.get("blocks", [])):
             elem_type = _classify_block_type(block, page_height, table_bboxes)
+            block_text = _extract_block_text(block)
+            max_font = 0.0
+            has_bold = False
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    size = float(span.get("size", 0.0))
+                    max_font = max(max_font, size)
+                    has_bold = has_bold or bool(int(span.get("flags", 0)) & _FLAG_BOLD)
+            if elem_type == "equation" and not _looks_like_equation(block_text):
+                elem_type = "text"
+            if elem_type in {"text", "list"} and (_HEADING_NUMBERED_RE.match(block_text) or has_bold) and max_font >= avg_size + 0.6:
+                elem_type = "heading1"
+            elif elem_type in {"text", "list"} and (_HEADING_NUMBERED_RE.match(block_text) or has_bold) and max_font >= avg_size:
+                elem_type = "heading2"
+            elif elem_type in {"text", "list"} and _HEADING_NUMBERED_RE.match(block_text):
+                elem_type = "heading3"
             bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
             elements.append(
                 {
                     "index": idx,
                     "type": elem_type,
+                    "text": block_text,
+                    "font_size": round(max_font, 2),
+                    "is_bold": has_bold,
                     "bbox": [round(v, 2) for v in bbox],
                 }
             )
@@ -2386,7 +2547,7 @@ def pdf_extract_element_coordinates(
     if page <= 0:
         raise ValueError("page must be > 0.")
 
-    _VALID_TYPES = {"text", "image", "table", "list", "header", "footer"}
+    _VALID_TYPES = {"text", "image", "table", "list", "header", "footer", "caption", "equation", "reference"}
     filter_types: set[str] | None = None
     if element_types:
         unknown = [t for t in element_types if t not in _VALID_TYPES]
@@ -2427,8 +2588,32 @@ def pdf_extract_element_coordinates(
                     "height": round(y1 - y0, 2),
                 }
             )
+        for order, elem in enumerate(sorted(elements, key=lambda e: (e["y0"], e["x0"])), start=1):
+            elem["reading_order"] = order
     finally:
         doc.close()
+
+    relationships: list[dict[str, Any]] = []
+    sorted_elements = sorted(elements, key=lambda e: (e["y0"], e["x0"]))
+    for i in range(len(sorted_elements) - 1):
+        cur = sorted_elements[i]
+        nxt = sorted_elements[i + 1]
+        if abs(cur["y0"] - nxt["y0"]) <= 2:
+            relation = "same_row"
+            distance = round(abs(nxt["x0"] - cur["x1"]), 2)
+        elif cur["x1"] <= nxt["x0"] and abs(cur["y0"] - nxt["y0"]) < max(cur["height"], nxt["height"]) * 0.8:
+            relation = "left_of"
+            distance = round(nxt["x0"] - cur["x1"], 2)
+        elif nxt["x1"] <= cur["x0"] and abs(cur["y0"] - nxt["y0"]) < max(cur["height"], nxt["height"]) * 0.8:
+            relation = "right_of"
+            distance = round(cur["x0"] - nxt["x1"], 2)
+        elif cur["y1"] <= nxt["y0"]:
+            relation = "above"
+            distance = round(nxt["y0"] - cur["y1"], 2)
+        else:
+            relation = "overlap"
+            distance = 0.0
+        relationships.append({"from": cur["index"], "to": nxt["index"], "relation": relation, "distance": distance})
 
     return {
         "workspace": str(WORKSPACE_DIR),
@@ -2438,6 +2623,11 @@ def pdf_extract_element_coordinates(
         "page_width": round(page_width, 2),
         "page_height": round(page_height, 2),
         "coordinate_unit": "pt",
+        "page_layout": {
+            "columns": 2 if page_width > 500 else 1,
+            "read_order": "top-to-bottom, left-to-right",
+        },
+        "relationships": relationships,
         "element_count": len(elements),
         "elements": elements,
     }
@@ -2460,6 +2650,7 @@ def pdf_read_tables(
         fitz_page = doc[page - 1]
 
         tables_out: list[dict[str, Any]] = []
+        diagnostics: list[str] = []
         try:
             finder = fitz_page.find_tables()
             for tbl_idx, tbl in enumerate(finder.tables):
@@ -2473,9 +2664,33 @@ def pdf_read_tables(
                         "bbox": [round(v, 2) for v in tbl.bbox],
                         "row_count": len(rows_cleaned),
                         "col_count": max((len(r) for r in rows_cleaned), default=0),
+                        "headers": rows_cleaned[0] if rows_cleaned else [],
+                        "rows": rows_cleaned[1:] if len(rows_cleaned) > 1 else [],
                         "data": rows_cleaned,
+                        "source": "detector",
                     }
                 )
+            if not tables_out:
+                diagnostics.append("No bordered table detected by find_tables(); trying text-alignment inference.")
+                inferred_tables = _infer_text_tables_from_alignment(fitz_page)
+                if not inferred_tables:
+                    diagnostics.append("Text-alignment inference empty; trying word-grid inference.")
+                    inferred_tables = _infer_text_tables_from_words(fitz_page)
+                for tbl_idx, tbl in enumerate(inferred_tables):
+                    tables_out.append(
+                        {
+                            "table_index": tbl_idx,
+                            "bbox": [round(v, 2) for v in tbl["bbox"]],
+                            "row_count": tbl["row_count"],
+                            "col_count": tbl["col_count"],
+                            "headers": tbl["data"][0] if tbl["data"] else [],
+                            "rows": tbl["data"][1:] if len(tbl["data"]) > 1 else [],
+                            "data": tbl["data"],
+                            "source": tbl["source"],
+                        }
+                    )
+                if not inferred_tables:
+                    diagnostics.append("No aligned multi-column text pattern found on this page.")
         except Exception as exc:
             raise ValueError(f"Table detection failed: {exc}") from exc
     finally:
@@ -2487,6 +2702,7 @@ def pdf_read_tables(
         "page": page,
         "page_count": total_pages,
         "table_count": len(tables_out),
+        "diagnostics": diagnostics,
         "tables": tables_out,
     }
 
@@ -2508,35 +2724,52 @@ def pdf_identify_formulas(
         fitz_page = doc[page - 1]
         text_dict = fitz_page.get_text("dict")
 
-        formulas: list[dict[str, Any]] = []
+        fragments: list[dict[str, Any]] = []
         for block_idx, block in enumerate(text_dict.get("blocks", [])):
             if block.get("type", 0) != 0:
                 continue
-            for line_idx, line in enumerate(block.get("lines", [])):
-                for span_idx, span in enumerate(line.get("spans", [])):
-                    text = span.get("text", "")
-                    font = span.get("font", "")
-                    has_math_chars = _contains_math(text)
-                    has_math_font = bool(_MATH_FONT_RE.search(font))
-                    if has_math_chars or has_math_font:
-                        math_chars = sorted(set(ch for ch in text if _is_math_char(ch)))
-                        formulas.append(
-                            {
-                                "block_index": block_idx,
-                                "line_index": line_idx,
-                                "span_index": span_idx,
-                                "text": text,
-                                "font": font,
-                                "font_size": round(float(span.get("size", 0.0)), 2),
-                                "has_math_chars": has_math_chars,
-                                "has_math_font": has_math_font,
-                                "math_chars": math_chars,
-                                "bbox": [
-                                    round(v, 2)
-                                    for v in span.get("bbox", (0.0, 0.0, 0.0, 0.0))
-                                ],
-                            }
-                        )
+            block_text = _extract_block_text(block)
+            if not _looks_like_equation(block_text):
+                continue
+            if "©" in block_text and len(block_text) < 8:
+                continue
+            if "=" not in block_text and len(re.findall(r"[+\-*/^∑∫√≤≥]", block_text)) < 2:
+                continue
+            math_symbol_count = sum(1 for ch in block_text if _is_math_char(ch))
+            op_count = len(re.findall(r"[=+\-*/^<>≤≥∑∫√]", block_text))
+            has_equals = "=" in block_text
+            confidence = min(0.99, round(0.35 + (0.22 if has_equals else 0.0) + 0.08 * math_symbol_count + 0.07 * op_count, 2))
+            fragments.append(
+                {
+                    "block_index": block_idx,
+                    "text": block_text,
+                    "bbox": [round(v, 2) for v in block.get("bbox", (0.0, 0.0, 0.0, 0.0))],
+                    "confidence": confidence,
+                    "type": "display" if len(block.get("lines", [])) > 1 else "inline",
+                }
+            )
+        formulas: list[dict[str, Any]] = []
+        fragments_sorted = sorted(fragments, key=lambda f: (f["bbox"][1], f["bbox"][0]))
+        for frag in fragments_sorted:
+            if not formulas:
+                formulas.append(frag)
+                continue
+            last = formulas[-1]
+            same_line = abs(frag["bbox"][1] - last["bbox"][1]) <= 8
+            vertical_gap = frag["bbox"][1] - last["bbox"][3]
+            near_block = 0 <= vertical_gap <= 4
+            if same_line or (near_block and len(frag["text"]) < 40 and len(last["text"]) < 120):
+                last["text"] = f"{last['text']} {frag['text']}".strip()
+                last["bbox"] = [
+                    min(last["bbox"][0], frag["bbox"][0]),
+                    min(last["bbox"][1], frag["bbox"][1]),
+                    max(last["bbox"][2], frag["bbox"][2]),
+                    max(last["bbox"][3], frag["bbox"][3]),
+                ]
+                last["confidence"] = round(max(last["confidence"], frag["confidence"]), 2)
+                last["type"] = "display" if (last["type"] == "display" or frag["type"] == "display") else "inline"
+            else:
+                formulas.append(frag)
     finally:
         doc.close()
 
@@ -2545,7 +2778,7 @@ def pdf_identify_formulas(
         "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
         "page": page,
         "page_count": total_pages,
-        "formula_span_count": len(formulas),
+        "formula_count": len(formulas),
         "formulas": formulas,
     }
 
@@ -2554,10 +2787,13 @@ def pdf_identify_formulas(
 def pdf_extract_element_styles(
     pdf_path: str,
     page: int = 1,
+    mode: str = "detailed",
 ) -> dict[str, Any]:
     """提取 PDF 页面中各文本块的样式（字号、字体、粗体/斜体、颜色、行距）。"""
     if page <= 0:
         raise ValueError("page must be > 0.")
+    if mode not in {"detailed", "summary"}:
+        raise ValueError("mode must be 'detailed' or 'summary'.")
 
     resolved, doc = _open_fitz_doc(pdf_path)
     try:
@@ -2568,6 +2804,11 @@ def pdf_extract_element_styles(
         text_dict = fitz_page.get_text("dict")
 
         elements: list[dict[str, Any]] = []
+        fonts_used: set[str] = set()
+        font_sizes: set[float] = set()
+        font_size_counts: Counter[float] = Counter()
+        colors_used: set[str] = set()
+        line_spacings: list[float] = []
         for block_idx, block in enumerate(text_dict.get("blocks", [])):
             if block.get("type", 0) != 0:
                 continue
@@ -2581,6 +2822,7 @@ def pdf_extract_element_styles(
                 line_spacing: float | None = None
                 if prev_line_top is not None:
                     line_spacing = round(line_top - prev_line_top, 2)
+                    line_spacings.append(line_spacing)
                 prev_line_top = line_top
 
                 spans_out: list[dict[str, Any]] = []
@@ -2590,6 +2832,10 @@ def pdf_extract_element_styles(
                     is_italic = bool(flags & _FLAG_ITALIC)
                     is_bold = bool(flags & _FLAG_BOLD)
                     color_hex = _int_to_hex_color(int(span.get("color", 0)))
+                    fonts_used.add(span.get("font", ""))
+                    font_sizes.add(round(float(span.get("size", 0.0)), 2))
+                    font_size_counts[round(float(span.get("size", 0.0)), 2)] += 1
+                    colors_used.add(color_hex)
                     spans_out.append(
                         {
                             "text": span.get("text", ""),
@@ -2626,13 +2872,27 @@ def pdf_extract_element_styles(
     finally:
         doc.close()
 
+    summary = {
+        "fonts_used": sorted(f for f in fonts_used if f),
+        "font_sizes": sorted(font_sizes),
+        "font_size_counts": dict(sorted(font_size_counts.items(), key=lambda it: it[0])),
+        "colors_used": sorted(colors_used),
+        "line_spacing_stats": {
+            "count": len(line_spacings),
+            "avg": round(sum(line_spacings) / len(line_spacings), 2) if line_spacings else None,
+            "min": min(line_spacings) if line_spacings else None,
+            "max": max(line_spacings) if line_spacings else None,
+        },
+    }
     return {
         "workspace": str(WORKSPACE_DIR),
         "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
         "page": page,
         "page_count": total_pages,
+        "mode": mode,
+        "summary": summary,
         "block_count": len(elements),
-        "elements": elements,
+        "elements": elements if mode == "detailed" else [],
     }
 
 
