@@ -253,6 +253,121 @@ def _build_ocr_fallback_resources(pdf_file: Path, enable_ocr_fallback: bool) -> 
         return None, None
 
 
+def _open_fitz_doc(pdf_path: str) -> tuple[Path, Any]:
+    resolved = _resolve_pdf_path(pdf_path)
+    if fitz is None:
+        raise ValueError(
+            "PyMuPDF (fitz) is required for this tool. Install pymupdf>=1.27.2."
+        )
+    try:
+        doc = fitz.open(str(resolved))
+    except Exception as exc:
+        raise ValueError(f"Failed to open PDF with PyMuPDF: {resolved}") from exc
+    return resolved, doc
+
+
+# Unicode ranges that strongly indicate mathematical content.
+_MATH_UNICODE_RANGES: list[tuple[int, int]] = [
+    (0x0391, 0x03C9),  # Greek letters (Α–ω)
+    (0x2100, 0x214F),  # Letterlike symbols
+    (0x2150, 0x218F),  # Number forms
+    (0x2190, 0x21FF),  # Arrows
+    (0x2200, 0x22FF),  # Mathematical operators
+    (0x27C0, 0x27EF),  # Miscellaneous mathematical symbols-A
+    (0x27F0, 0x27FF),  # Supplemental arrows-A
+    (0x2900, 0x297F),  # Supplemental arrows-B
+    (0x2980, 0x29FF),  # Miscellaneous mathematical symbols-B
+    (0x2A00, 0x2AFF),  # Supplemental mathematical operators
+    (0x00B1, 0x00B1),  # ±
+    (0x00B2, 0x00B3),  # ²³
+    (0x00B5, 0x00B5),  # µ
+    (0x00D7, 0x00D7),  # ×
+    (0x00F7, 0x00F7),  # ÷
+    (0x207F, 0x207F),  # ⁿ
+    (0x2308, 0x230B),  # ⌈⌉⌊⌋
+]
+
+# Font names associated with mathematical typesetting (LaTeX, Word, etc.).
+_MATH_FONT_RE = re.compile(
+    r"(CMMI|CMSY|CMEX|Symbol|Math|CambriaMath|STIX|Asana|DejaVuMath|MnSymbol)",
+    re.IGNORECASE,
+)
+
+# Pattern for numbered / bulleted list items.
+_NUMBERED_LIST_RE = re.compile(r"^\s*(\d+[.)]\s|[a-zA-Z][.)]\s|[•·▪▸◦‣⁃➢➣➤])")
+
+# Fraction of page height treated as header / footer margin.
+_HEADER_FOOTER_MARGIN = 0.08
+
+
+def _is_math_char(ch: str) -> bool:
+    cp = ord(ch)
+    for lo, hi in _MATH_UNICODE_RANGES:
+        if lo <= cp <= hi:
+            return True
+    return False
+
+
+def _contains_math(text: str) -> bool:
+    return any(_is_math_char(ch) for ch in text)
+
+
+def _classify_block_type(
+    block: dict[str, Any],
+    page_height: float,
+    table_bboxes: list[tuple[float, float, float, float]],
+) -> str:
+    """Return a human-readable element type for a PyMuPDF text-dict block."""
+    if block.get("type", 0) == 1:
+        return "image"
+
+    bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
+    x0, y0, x1, y1 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+
+    # Check for overlap with any detected table bounding box.
+    for tx0, ty0, tx1, ty1 in table_bboxes:
+        overlap_x = min(x1, tx1) - max(x0, tx0)
+        overlap_y = min(y1, ty1) - max(y0, ty0)
+        if overlap_x > 0 and overlap_y > 0:
+            block_area = max(1.0, (x1 - x0) * (y1 - y0))
+            if (overlap_x * overlap_y) / block_area >= 0.5:
+                return "table"
+
+    # Position-based header / footer detection.
+    if y1 <= page_height * _HEADER_FOOTER_MARGIN:
+        return "header"
+    if y0 >= page_height * (1.0 - _HEADER_FOOTER_MARGIN):
+        return "footer"
+
+    # Numbered / bulleted list detection from the first span of the first line.
+    for line in block.get("lines", [])[:1]:
+        for span in line.get("spans", []):
+            if _NUMBERED_LIST_RE.match(span.get("text", "")):
+                return "list"
+
+    return "text"
+
+
+def _get_table_bboxes(fitz_page: Any) -> list[tuple[float, float, float, float]]:
+    """Return bounding boxes of all tables on a PyMuPDF page."""
+    try:
+        finder = fitz_page.find_tables()
+        return [(float(b[0]), float(b[1]), float(b[2]), float(b[3])) for b in (tbl.bbox for tbl in finder.tables)]
+    except Exception:
+        return []
+
+
+# PyMuPDF span flag bit positions (see MuPDF source / PyMuPDF docs).
+_FLAG_SUPERSCRIPT = 1 << 0  # bit 0
+_FLAG_ITALIC = 1 << 1       # bit 1
+_FLAG_BOLD = 1 << 4          # bit 4
+
+
+def _int_to_hex_color(color_int: int) -> str:
+    """Convert a PyMuPDF sRGB integer (0xRRGGBB) to a CSS hex color string."""
+    return f"#{(color_int >> 16) & 0xFF:02X}{(color_int >> 8) & 0xFF:02X}{color_int & 0xFF:02X}"
+
+
 def _create_or_replace_view(
     con: duckdb.DuckDBPyConnection, table_name: str, csv_path: str, ignore_errors: bool
 ) -> str:
@@ -2215,6 +2330,309 @@ def pdf_extract_content(
         "ocr_fallback": ocr_fallback,
         "page_sources": page_sources,
         "content": content,
+    }
+
+
+@mcp.tool()
+def pdf_identify_element_types(
+    pdf_path: str,
+    page: int = 1,
+) -> dict[str, Any]:
+    """识别 PDF 页面中各元素的类型（text/image/table/list/header/footer）。"""
+    if page <= 0:
+        raise ValueError("page must be > 0.")
+
+    resolved, doc = _open_fitz_doc(pdf_path)
+    try:
+        total_pages = doc.page_count
+        if page > total_pages:
+            raise ValueError(f"page {page} exceeds total pages {total_pages}.")
+        fitz_page = doc[page - 1]
+        page_height = float(fitz_page.rect.height)
+
+        table_bboxes = _get_table_bboxes(fitz_page)
+        text_dict = fitz_page.get_text("dict")
+        elements: list[dict[str, Any]] = []
+        for idx, block in enumerate(text_dict.get("blocks", [])):
+            elem_type = _classify_block_type(block, page_height, table_bboxes)
+            bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
+            elements.append(
+                {
+                    "index": idx,
+                    "type": elem_type,
+                    "bbox": [round(v, 2) for v in bbox],
+                }
+            )
+    finally:
+        doc.close()
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "page": page,
+        "page_count": total_pages,
+        "element_count": len(elements),
+        "elements": elements,
+    }
+
+
+@mcp.tool()
+def pdf_extract_element_coordinates(
+    pdf_path: str,
+    page: int = 1,
+    element_types: list[str] | None = None,
+) -> dict[str, Any]:
+    """提取 PDF 页面中各元素的坐标（x0/y0 左上角，x1/y1 右下角，单位 pt）。"""
+    if page <= 0:
+        raise ValueError("page must be > 0.")
+
+    _VALID_TYPES = {"text", "image", "table", "list", "header", "footer"}
+    filter_types: set[str] | None = None
+    if element_types:
+        unknown = [t for t in element_types if t not in _VALID_TYPES]
+        if unknown:
+            raise ValueError(
+                f"Unknown element types: {unknown}. Valid: {sorted(_VALID_TYPES)}"
+            )
+        filter_types = set(element_types)
+
+    resolved, doc = _open_fitz_doc(pdf_path)
+    try:
+        total_pages = doc.page_count
+        if page > total_pages:
+            raise ValueError(f"page {page} exceeds total pages {total_pages}.")
+        fitz_page = doc[page - 1]
+        page_rect = fitz_page.rect
+        page_height = float(page_rect.height)
+        page_width = float(page_rect.width)
+
+        table_bboxes = _get_table_bboxes(fitz_page)
+        text_dict = fitz_page.get_text("dict")
+        elements: list[dict[str, Any]] = []
+        for idx, block in enumerate(text_dict.get("blocks", [])):
+            elem_type = _classify_block_type(block, page_height, table_bboxes)
+            if filter_types and elem_type not in filter_types:
+                continue
+            bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
+            x0, y0, x1, y1 = (float(v) for v in bbox)
+            elements.append(
+                {
+                    "index": idx,
+                    "type": elem_type,
+                    "x0": round(x0, 2),
+                    "y0": round(y0, 2),
+                    "x1": round(x1, 2),
+                    "y1": round(y1, 2),
+                    "width": round(x1 - x0, 2),
+                    "height": round(y1 - y0, 2),
+                }
+            )
+    finally:
+        doc.close()
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "page": page,
+        "page_count": total_pages,
+        "page_width": round(page_width, 2),
+        "page_height": round(page_height, 2),
+        "coordinate_unit": "pt",
+        "element_count": len(elements),
+        "elements": elements,
+    }
+
+
+@mcp.tool()
+def pdf_read_tables(
+    pdf_path: str,
+    page: int = 1,
+) -> dict[str, Any]:
+    """识别并读取 PDF 页面中的表格，以二维数组形式返回每张表格的内容。"""
+    if page <= 0:
+        raise ValueError("page must be > 0.")
+
+    resolved, doc = _open_fitz_doc(pdf_path)
+    try:
+        total_pages = doc.page_count
+        if page > total_pages:
+            raise ValueError(f"page {page} exceeds total pages {total_pages}.")
+        fitz_page = doc[page - 1]
+
+        tables_out: list[dict[str, Any]] = []
+        try:
+            finder = fitz_page.find_tables()
+            for tbl_idx, tbl in enumerate(finder.tables):
+                data = tbl.extract()
+                rows_cleaned = [
+                    [cell if cell is not None else "" for cell in row] for row in data
+                ]
+                tables_out.append(
+                    {
+                        "table_index": tbl_idx,
+                        "bbox": [round(v, 2) for v in tbl.bbox],
+                        "row_count": len(rows_cleaned),
+                        "col_count": max((len(r) for r in rows_cleaned), default=0),
+                        "data": rows_cleaned,
+                    }
+                )
+        except Exception as exc:
+            raise ValueError(f"Table detection failed: {exc}") from exc
+    finally:
+        doc.close()
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "page": page,
+        "page_count": total_pages,
+        "table_count": len(tables_out),
+        "tables": tables_out,
+    }
+
+
+@mcp.tool()
+def pdf_identify_formulas(
+    pdf_path: str,
+    page: int = 1,
+) -> dict[str, Any]:
+    """识别 PDF 页面中包含数学公式或数学符号的文本片段（不使用 OCR）。"""
+    if page <= 0:
+        raise ValueError("page must be > 0.")
+
+    resolved, doc = _open_fitz_doc(pdf_path)
+    try:
+        total_pages = doc.page_count
+        if page > total_pages:
+            raise ValueError(f"page {page} exceeds total pages {total_pages}.")
+        fitz_page = doc[page - 1]
+        text_dict = fitz_page.get_text("dict")
+
+        formulas: list[dict[str, Any]] = []
+        for block_idx, block in enumerate(text_dict.get("blocks", [])):
+            if block.get("type", 0) != 0:
+                continue
+            for line_idx, line in enumerate(block.get("lines", [])):
+                for span_idx, span in enumerate(line.get("spans", [])):
+                    text = span.get("text", "")
+                    font = span.get("font", "")
+                    has_math_chars = _contains_math(text)
+                    has_math_font = bool(_MATH_FONT_RE.search(font))
+                    if has_math_chars or has_math_font:
+                        math_chars = sorted(set(ch for ch in text if _is_math_char(ch)))
+                        formulas.append(
+                            {
+                                "block_index": block_idx,
+                                "line_index": line_idx,
+                                "span_index": span_idx,
+                                "text": text,
+                                "font": font,
+                                "font_size": round(float(span.get("size", 0.0)), 2),
+                                "has_math_chars": has_math_chars,
+                                "has_math_font": has_math_font,
+                                "math_chars": math_chars,
+                                "bbox": [
+                                    round(v, 2)
+                                    for v in span.get("bbox", (0.0, 0.0, 0.0, 0.0))
+                                ],
+                            }
+                        )
+    finally:
+        doc.close()
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "page": page,
+        "page_count": total_pages,
+        "formula_span_count": len(formulas),
+        "formulas": formulas,
+    }
+
+
+@mcp.tool()
+def pdf_extract_element_styles(
+    pdf_path: str,
+    page: int = 1,
+) -> dict[str, Any]:
+    """提取 PDF 页面中各文本块的样式（字号、字体、粗体/斜体、颜色、行距）。"""
+    if page <= 0:
+        raise ValueError("page must be > 0.")
+
+    resolved, doc = _open_fitz_doc(pdf_path)
+    try:
+        total_pages = doc.page_count
+        if page > total_pages:
+            raise ValueError(f"page {page} exceeds total pages {total_pages}.")
+        fitz_page = doc[page - 1]
+        text_dict = fitz_page.get_text("dict")
+
+        elements: list[dict[str, Any]] = []
+        for block_idx, block in enumerate(text_dict.get("blocks", [])):
+            if block.get("type", 0) != 0:
+                continue
+            block_bbox = block.get("bbox", (0.0, 0.0, 0.0, 0.0))
+            lines = block.get("lines", [])
+            block_lines_out: list[dict[str, Any]] = []
+            prev_line_top: float | None = None
+            for line_idx, line in enumerate(lines):
+                line_bbox = line.get("bbox", (0.0, 0.0, 0.0, 0.0))
+                line_top = float(line_bbox[1])
+                line_spacing: float | None = None
+                if prev_line_top is not None:
+                    line_spacing = round(line_top - prev_line_top, 2)
+                prev_line_top = line_top
+
+                spans_out: list[dict[str, Any]] = []
+                for span in line.get("spans", []):
+                    flags = int(span.get("flags", 0))
+                    is_superscript = bool(flags & _FLAG_SUPERSCRIPT)
+                    is_italic = bool(flags & _FLAG_ITALIC)
+                    is_bold = bool(flags & _FLAG_BOLD)
+                    color_hex = _int_to_hex_color(int(span.get("color", 0)))
+                    spans_out.append(
+                        {
+                            "text": span.get("text", ""),
+                            "font": span.get("font", ""),
+                            "size": round(float(span.get("size", 0.0)), 2),
+                            "is_bold": is_bold,
+                            "is_italic": is_italic,
+                            "is_superscript": is_superscript,
+                            "color": color_hex,
+                            "bbox": [
+                                round(v, 2)
+                                for v in span.get("bbox", (0.0, 0.0, 0.0, 0.0))
+                            ],
+                        }
+                    )
+
+                block_lines_out.append(
+                    {
+                        "line_index": line_idx,
+                        "line_spacing_from_prev": line_spacing,
+                        "bbox": [round(v, 2) for v in line_bbox],
+                        "spans": spans_out,
+                    }
+                )
+
+            elements.append(
+                {
+                    "block_index": block_idx,
+                    "bbox": [round(v, 2) for v in block_bbox],
+                    "line_count": len(lines),
+                    "lines": block_lines_out,
+                }
+            )
+    finally:
+        doc.close()
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "page": page,
+        "page_count": total_pages,
+        "block_count": len(elements),
+        "elements": elements,
     }
 
 
