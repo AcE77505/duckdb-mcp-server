@@ -50,7 +50,8 @@ _PDF_SEARCH_SNIPPET_CONTEXT_CHARS = 60
 _LOCAL_OCR_ENDPOINT = "http://localhost:8111/v1/chat/completions"
 _LOCAL_OCR_MODEL = "PaddleOCR-VL-1.5"
 _LOCAL_OCR_TIMEOUT_SECONDS = 120
-_LOCAL_OCR_MAX_EDGE = 2000
+_LOCAL_OCR_DEFAULT_SCALE_EDGE = 5000
+_LOCAL_OCR_FORCE_SCALE_EDGE = 2000
 
 
 def _load_mcp_config() -> dict[str, Any]:
@@ -226,13 +227,18 @@ def _build_local_ocr_prompt(scene_type: str) -> str:
     return f"{system_prompt}\n补充要求：优先输出 PPT 的标题、正文、页脚结构。"
 
 
-def _encode_image_to_data_url(image_path: Path) -> str:
+def _encode_image_to_data_url(image_path: Path, enable_resize: bool = False) -> str:
     with Image.open(image_path) as image:
         rgb = image.convert("RGB")
         width, height = rgb.size
         long_edge = max(width, height)
-        if long_edge > _LOCAL_OCR_MAX_EDGE:
-            scale = _LOCAL_OCR_MAX_EDGE / float(long_edge)
+        target_max_edge = None
+        if long_edge > _LOCAL_OCR_DEFAULT_SCALE_EDGE:
+            target_max_edge = _LOCAL_OCR_DEFAULT_SCALE_EDGE
+        elif enable_resize and long_edge > _LOCAL_OCR_FORCE_SCALE_EDGE:
+            target_max_edge = _LOCAL_OCR_FORCE_SCALE_EDGE
+        if target_max_edge is not None:
+            scale = target_max_edge / float(long_edge)
             rgb = rgb.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
         buf = BytesIO()
         rgb.save(buf, format="JPEG", quality=90, optimize=True)
@@ -3219,12 +3225,17 @@ def pymupdf_4llm_convert(path: str, output: str = "markdown") -> dict[str, Any]:
 
 
 @mcp.tool()
-def local_ocr_analyze(image_path: str) -> dict[str, Any]:
-    """对本地图片进行高级 OCR 识别，支持文本提取、表格转 Markdown、公式解析及受力分析图等复杂图描述。"""
+def local_ocr_analyze(image_path: str, enable_resize: bool = False) -> dict[str, Any]:
+    """对本地图片进行高级 OCR 识别，支持文本提取、表格转 Markdown、公式解析及受力分析图等复杂图描述。
+
+    参数说明：
+    - enable_resize: 是否启用“长边超过 2000 像素时缩放到 2000”的开关（默认 false）。
+      无论开关状态如何，长边超过 5000 像素时都会默认缩放到 5000。
+    """
     resolved = _resolve_local_image_path(image_path)
     scene_type = _guess_ocr_scene_type(resolved)
     prompt = _build_local_ocr_prompt(scene_type)
-    first_data_url = _encode_image_to_data_url(resolved)
+    first_data_url = _encode_image_to_data_url(resolved, enable_resize=enable_resize)
     response_json = _call_local_ocr_service(
         image_data_url=first_data_url,
         prompt=prompt,
@@ -3264,6 +3275,7 @@ def local_ocr_analyze(image_path: str) -> dict[str, Any]:
         "scene_type": scene_type,
         "prompt": prompt,
         "timeout_seconds": _LOCAL_OCR_TIMEOUT_SECONDS,
+        "enable_resize": enable_resize,
         "used_preprocess_retry": used_preprocess_retry,
         "result": text,
         "raw_response": response_json,
