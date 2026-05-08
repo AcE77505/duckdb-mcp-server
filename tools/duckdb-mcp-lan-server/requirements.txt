@@ -6,3 +6,4 @@ pymupdf4llm>=0.0.27
 rapidocr-onnxruntime>=1.4.4; python_version < "3.13"
 matplotlib>=3.9.2
 scipy>=1.14.1
+requests>=2.14.0
