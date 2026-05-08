@@ -1,6 +1,10 @@
 import os
 import re
 import json
+import base64
+import mimetypes
+import urllib.error
+import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,6 +12,7 @@ from typing import Any
 
 import duckdb
 import matplotlib
+import numpy as np
 from mcp.server.fastmcp import FastMCP
 from pypdf import PdfReader
 from scipy import stats as scipy_stats
@@ -41,6 +46,9 @@ _FZ_GARBLED_MIN_TEXT_LEN = 120
 _FZ_GARBLED_MIN_RATIO = 0.05
 _PDF_OCR_RENDER_SCALE = 2
 _PDF_SEARCH_SNIPPET_CONTEXT_CHARS = 60
+_LOCAL_OCR_ENDPOINT = "http://localhost:8111/v1/chat/completions"
+_LOCAL_OCR_MODEL = "PaddleOCR-VL-1.5"
+_LOCAL_OCR_TIMEOUT_SECONDS = 45
 
 
 def _load_mcp_config() -> dict[str, Any]:
@@ -177,6 +185,104 @@ def _resolve_pdf_path(pdf_path: str) -> Path:
     if path.suffix.lower() != ".pdf":
         raise ValueError(f"Not a PDF file: {path}")
     return path
+
+
+def _resolve_local_image_path(image_path: str) -> Path:
+    path = _resolve_workspace_path(image_path)
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"Image file not found: {path}")
+    return path
+
+
+def _guess_ocr_scene_type(image_path: Path) -> str:
+    name = image_path.name.lower()
+    if any(token in name for token in ("table", "表格", "sheet", "grid")):
+        return "table"
+    if any(token in name for token in ("formula", "equation", "math", "物理", "公式", "推导")):
+        return "formula"
+    if any(token in name for token in ("force", "freebody", "流程", "flow", "diagram", "受力")):
+        return "diagram"
+    return "general"
+
+
+def _build_local_ocr_prompt(scene_type: str) -> str:
+    base = "请先完整识别图像内容，再进行低幻觉校验：检查明显不合逻辑的符号、单位、箭头关系，并在有疑问处标注“[待核验]”。"
+    prompts = {
+        "general": "请提取图中所有文字，保持原始换行排版。若是 PPT 截图，请按标题、正文、页脚顺序输出。",
+        "table": "图中包含表格，请将其转换为 Markdown 格式输出，确保行列对齐。",
+        "formula": "图中包含数学/物理公式和推导过程，请使用 LaTeX 格式输出公式，并逐步提取计算步骤。",
+        "diagram": "请详细描述图中的图形结构、箭头指向以及关联的文字标注，分析受力情况或流程逻辑。",
+    }
+    return f"{prompts.get(scene_type, prompts['general'])}\n{base}"
+
+
+def _encode_image_to_data_url(image_path: Path) -> str:
+    content = image_path.read_bytes()
+    encoded = base64.b64encode(content).decode("ascii")
+    mime, _ = mimetypes.guess_type(image_path.name)
+    if not mime or not mime.startswith("image/"):
+        mime = "image/jpeg"
+    return f"data:{mime};base64,{encoded}"
+
+
+def _preprocess_image_for_retry(image_path: Path) -> str:
+    pixels = plt.imread(str(image_path))
+    if pixels.ndim == 3:
+        if pixels.shape[2] >= 3:
+            pixels = pixels[..., :3]
+            gray = pixels @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        else:
+            gray = pixels[..., 0]
+    else:
+        gray = pixels
+    if gray.max() <= 1.0:
+        gray = gray * 255.0
+    gray = gray.astype(np.float32)
+    threshold = float(np.mean(gray))
+    bw = np.where(gray > threshold, 255, 0).astype(np.uint8)
+    scale = 1.5
+    new_h = max(1, int(bw.shape[0] * scale))
+    new_w = max(1, int(bw.shape[1] * scale))
+    resized = np.repeat(np.repeat(bw, int(np.ceil(scale)), axis=0), int(np.ceil(scale)), axis=1)[:new_h, :new_w]
+    from io import BytesIO
+
+    buf = BytesIO()
+    plt.imsave(buf, resized, cmap="gray", format="png")
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _call_local_ocr_service(image_data_url: str, prompt: str, timeout_seconds: int) -> dict[str, Any]:
+    payload = {
+        "model": _LOCAL_OCR_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            }
+        ],
+        "stream": False,
+        "temperature": 0,
+    }
+    req = urllib.request.Request(
+        _LOCAL_OCR_ENDPOINT,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except TimeoutError as exc:
+        raise ValueError(f"OCR request timeout after {timeout_seconds}s") from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"OCR service unavailable: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("OCR service returned invalid JSON.") from exc
+    return data
 
 
 def _read_pdf(pdf_path: str) -> tuple[Path, PdfReader]:
@@ -3101,6 +3207,55 @@ def pymupdf_4llm_convert(path: str, output: str = "markdown") -> dict[str, Any]:
         "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
         "output": mode,
         "content": content,
+    }
+
+
+@mcp.tool()
+def local_ocr_analyze(image_path: str) -> dict[str, Any]:
+    """对本地图片进行高级 OCR 识别，支持文本提取、表格转 Markdown、公式解析及受力分析图等复杂图描述。"""
+    resolved = _resolve_local_image_path(image_path)
+    scene_type = _guess_ocr_scene_type(resolved)
+    prompt = _build_local_ocr_prompt(scene_type)
+    first_data_url = _encode_image_to_data_url(resolved)
+    response_json = _call_local_ocr_service(
+        image_data_url=first_data_url,
+        prompt=prompt,
+        timeout_seconds=_LOCAL_OCR_TIMEOUT_SECONDS,
+    )
+
+    choices = response_json.get("choices") if isinstance(response_json, dict) else None
+    text = ""
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message", {})
+        if isinstance(message, dict):
+            text = str(message.get("content", "")).strip()
+
+    used_preprocess_retry = False
+    if not text:
+        retry_data_url = _preprocess_image_for_retry(resolved)
+        retry_response_json = _call_local_ocr_service(
+            image_data_url=retry_data_url,
+            prompt=prompt,
+            timeout_seconds=60,
+        )
+        used_preprocess_retry = True
+        retry_choices = retry_response_json.get("choices") if isinstance(retry_response_json, dict) else None
+        if isinstance(retry_choices, list) and retry_choices:
+            retry_message = retry_choices[0].get("message", {})
+            if isinstance(retry_message, dict):
+                text = str(retry_message.get("content", "")).strip()
+        response_json = retry_response_json
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "image_path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "model": _LOCAL_OCR_MODEL,
+        "scene_type": scene_type,
+        "prompt": prompt,
+        "timeout_seconds": _LOCAL_OCR_TIMEOUT_SECONDS,
+        "used_preprocess_retry": used_preprocess_retry,
+        "result": text,
+        "raw_response": response_json,
     }
 
 
