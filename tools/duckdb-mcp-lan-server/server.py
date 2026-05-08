@@ -1,14 +1,20 @@
 import os
 import re
 import json
+import base64
+import mimetypes
 from collections import Counter
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import duckdb
 import matplotlib
+import numpy as np
+import requests
 from mcp.server.fastmcp import FastMCP
+from PIL import Image
 from pypdf import PdfReader
 from scipy import stats as scipy_stats
 
@@ -41,6 +47,10 @@ _FZ_GARBLED_MIN_TEXT_LEN = 120
 _FZ_GARBLED_MIN_RATIO = 0.05
 _PDF_OCR_RENDER_SCALE = 2
 _PDF_SEARCH_SNIPPET_CONTEXT_CHARS = 60
+_LOCAL_OCR_ENDPOINT = "http://localhost:8111/v1/chat/completions"
+_LOCAL_OCR_MODEL = "PaddleOCR-VL-1.5"
+_LOCAL_OCR_TIMEOUT_SECONDS = 120
+_LOCAL_OCR_MAX_EDGE = 2000
 
 
 def _load_mcp_config() -> dict[str, Any]:
@@ -177,6 +187,110 @@ def _resolve_pdf_path(pdf_path: str) -> Path:
     if path.suffix.lower() != ".pdf":
         raise ValueError(f"Not a PDF file: {path}")
     return path
+
+
+def _resolve_local_image_path(image_path: str) -> Path:
+    path = _resolve_workspace_path(image_path)
+    if not path.exists() or not path.is_file():
+        raise ValueError(f"Image file not found: {path}")
+    return path
+
+
+def _guess_ocr_scene_type(image_path: Path) -> str:
+    name = image_path.name.lower()
+    if any(token in name for token in ("table", "表格", "sheet", "grid")):
+        return "table"
+    if any(token in name for token in ("formula", "equation", "math", "物理", "公式", "推导")):
+        return "formula"
+    if any(token in name for token in ("force", "freebody", "流程", "flow", "diagram", "受力")):
+        return "diagram"
+    return "general"
+
+
+def _build_local_ocr_prompt(scene_type: str) -> str:
+    system_prompt = (
+        "你是一个专业的 OCR 与物理工程分析助手。请识别图中的：\n"
+        "1. 所有文本（保持原始排版）。\n"
+        "2. 表格（转换为标准 Markdown）。\n"
+        "3. 数学与物理公式（使用 LaTeX 格式）。\n"
+        "4. 受力分析（描述受力点、箭头指向及标注数值）。\n\n"
+        "注意：直接输出识别后的结构化内容，禁止进行任何开场白、自我介绍或多余的解释。"
+        "如果图中没有文字，请直接返回 [空]。"
+    )
+    if scene_type == "table":
+        return f"{system_prompt}\n补充要求：优先保证表格列对齐与表头准确。"
+    if scene_type == "formula":
+        return f"{system_prompt}\n补充要求：公式必须使用可渲染 LaTeX，并按推导顺序输出。"
+    if scene_type == "diagram":
+        return f"{system_prompt}\n补充要求：明确每个受力点与箭头方向，避免冗长描述。"
+    return f"{system_prompt}\n补充要求：优先输出 PPT 的标题、正文、页脚结构。"
+
+
+def _encode_image_to_data_url(image_path: Path) -> str:
+    with Image.open(image_path) as image:
+        rgb = image.convert("RGB")
+        width, height = rgb.size
+        long_edge = max(width, height)
+        if long_edge > _LOCAL_OCR_MAX_EDGE:
+            scale = _LOCAL_OCR_MAX_EDGE / float(long_edge)
+            rgb = rgb.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
+        buf = BytesIO()
+        rgb.save(buf, format="JPEG", quality=90, optimize=True)
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii").replace("\n", "")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _preprocess_image_for_retry(image_path: Path) -> str:
+    with Image.open(image_path) as image:
+        gray = image.convert("L")
+        threshold = int(np.array(gray).mean())
+        bw = gray.point(lambda p: 255 if p > threshold else 0)
+        rgb = bw.convert("RGB")
+        width, height = rgb.size
+        rgb = rgb.resize((max(1, int(width * 1.25)), max(1, int(height * 1.25))), Image.Resampling.LANCZOS)
+        buf = BytesIO()
+        rgb.save(buf, format="JPEG", quality=85, optimize=True)
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii").replace("\n", "")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _call_local_ocr_service(image_data_url: str, prompt: str, timeout_seconds: int) -> dict[str, Any]:
+    payload = {
+        "model": _LOCAL_OCR_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            }
+        ],
+        "stream": False,
+        "temperature": 0,
+        "max_tokens": 4096,
+    }
+    try:
+        response = requests.post(
+            _LOCAL_OCR_ENDPOINT,
+            json=payload,
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except TimeoutError as exc:
+        raise ValueError(
+            f"OCR request timeout after {timeout_seconds}s，请检查 llama-server 后台显存占用情况。"
+        ) from exc
+    except requests.Timeout as exc:
+        raise ValueError(
+            f"OCR request timeout after {timeout_seconds}s，请检查 llama-server 后台显存占用情况。"
+        ) from exc
+    except requests.RequestException as exc:
+        raise ValueError(f"OCR service unavailable: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("OCR service returned invalid JSON.") from exc
+    return data
 
 
 def _read_pdf(pdf_path: str) -> tuple[Path, PdfReader]:
@@ -3101,6 +3215,58 @@ def pymupdf_4llm_convert(path: str, output: str = "markdown") -> dict[str, Any]:
         "path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
         "output": mode,
         "content": content,
+    }
+
+
+@mcp.tool()
+def local_ocr_analyze(image_path: str) -> dict[str, Any]:
+    """对本地图片进行高级 OCR 识别，支持文本提取、表格转 Markdown、公式解析及受力分析图等复杂图描述。"""
+    resolved = _resolve_local_image_path(image_path)
+    scene_type = _guess_ocr_scene_type(resolved)
+    prompt = _build_local_ocr_prompt(scene_type)
+    first_data_url = _encode_image_to_data_url(resolved)
+    response_json = _call_local_ocr_service(
+        image_data_url=first_data_url,
+        prompt=prompt,
+        timeout_seconds=_LOCAL_OCR_TIMEOUT_SECONDS,
+    )
+
+    choices = response_json.get("choices") if isinstance(response_json, dict) else None
+    text = ""
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message", {})
+        if isinstance(message, dict):
+            text = str(message.get("content", "")).strip()
+
+    used_preprocess_retry = False
+    if not text:
+        retry_data_url = _preprocess_image_for_retry(resolved)
+        retry_response_json = _call_local_ocr_service(
+            image_data_url=retry_data_url,
+            prompt=prompt,
+            timeout_seconds=60,
+        )
+        used_preprocess_retry = True
+        retry_choices = retry_response_json.get("choices") if isinstance(retry_response_json, dict) else None
+        if isinstance(retry_choices, list) and retry_choices:
+            retry_message = retry_choices[0].get("message", {})
+            if isinstance(retry_message, dict):
+                text = str(retry_message.get("content", "")).strip()
+        response_json = retry_response_json
+
+    if text and text.count("$") % 2 == 1:
+        text = f"{text}$"
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "image_path": resolved.relative_to(WORKSPACE_DIR).as_posix(),
+        "model": _LOCAL_OCR_MODEL,
+        "scene_type": scene_type,
+        "prompt": prompt,
+        "timeout_seconds": _LOCAL_OCR_TIMEOUT_SECONDS,
+        "used_preprocess_retry": used_preprocess_retry,
+        "result": text,
+        "raw_response": response_json,
     }
 
 
