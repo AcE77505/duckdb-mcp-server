@@ -3,17 +3,18 @@ import re
 import json
 import base64
 import mimetypes
-import urllib.error
-import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import duckdb
 import matplotlib
 import numpy as np
+import requests
 from mcp.server.fastmcp import FastMCP
+from PIL import Image
 from pypdf import PdfReader
 from scipy import stats as scipy_stats
 
@@ -48,7 +49,8 @@ _PDF_OCR_RENDER_SCALE = 2
 _PDF_SEARCH_SNIPPET_CONTEXT_CHARS = 60
 _LOCAL_OCR_ENDPOINT = "http://localhost:8111/v1/chat/completions"
 _LOCAL_OCR_MODEL = "PaddleOCR-VL-1.5"
-_LOCAL_OCR_TIMEOUT_SECONDS = 45
+_LOCAL_OCR_TIMEOUT_SECONDS = 120
+_LOCAL_OCR_MAX_EDGE = 2000
 
 
 def _load_mcp_config() -> dict[str, Any]:
@@ -206,50 +208,50 @@ def _guess_ocr_scene_type(image_path: Path) -> str:
 
 
 def _build_local_ocr_prompt(scene_type: str) -> str:
-    base = "请先完整识别图像内容，再进行低幻觉校验：检查明显不合逻辑的符号、单位、箭头关系，并在有疑问处标注“[待核验]”。"
-    prompts = {
-        "general": "请提取图中所有文字，保持原始换行排版。若是 PPT 截图，请按标题、正文、页脚顺序输出。",
-        "table": "图中包含表格，请将其转换为 Markdown 格式输出，确保行列对齐。",
-        "formula": "图中包含数学/物理公式和推导过程，请使用 LaTeX 格式输出公式，并逐步提取计算步骤。",
-        "diagram": "请详细描述图中的图形结构、箭头指向以及关联的文字标注，分析受力情况或流程逻辑。",
-    }
-    return f"{prompts.get(scene_type, prompts['general'])}\n{base}"
+    system_prompt = (
+        "你是一个专业的 OCR 与物理工程分析助手。请识别图中的：\n"
+        "1. 所有文本（保持原始排版）。\n"
+        "2. 表格（转换为标准 Markdown）。\n"
+        "3. 数学与物理公式（使用 LaTeX 格式）。\n"
+        "4. 受力分析（描述受力点、箭头指向及标注数值）。\n\n"
+        "注意：直接输出识别后的结构化内容，禁止进行任何开场白、自我介绍或多余的解释。"
+        "如果图中没有文字，请直接返回 [空]。"
+    )
+    if scene_type == "table":
+        return f"{system_prompt}\n补充要求：优先保证表格列对齐与表头准确。"
+    if scene_type == "formula":
+        return f"{system_prompt}\n补充要求：公式必须使用可渲染 LaTeX，并按推导顺序输出。"
+    if scene_type == "diagram":
+        return f"{system_prompt}\n补充要求：明确每个受力点与箭头方向，避免冗长描述。"
+    return f"{system_prompt}\n补充要求：优先输出 PPT 的标题、正文、页脚结构。"
 
 
 def _encode_image_to_data_url(image_path: Path) -> str:
-    content = image_path.read_bytes()
-    encoded = base64.b64encode(content).decode("ascii")
-    mime, _ = mimetypes.guess_type(image_path.name)
-    if not mime or not mime.startswith("image/"):
-        mime = "image/jpeg"
-    return f"data:{mime};base64,{encoded}"
+    with Image.open(image_path) as image:
+        rgb = image.convert("RGB")
+        width, height = rgb.size
+        long_edge = max(width, height)
+        if long_edge > _LOCAL_OCR_MAX_EDGE:
+            scale = _LOCAL_OCR_MAX_EDGE / float(long_edge)
+            rgb = rgb.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
+        buf = BytesIO()
+        rgb.save(buf, format="JPEG", quality=90, optimize=True)
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii").replace("\n", "")
+    return f"data:image/jpeg;base64,{encoded}"
 
 
 def _preprocess_image_for_retry(image_path: Path) -> str:
-    pixels = plt.imread(str(image_path))
-    if pixels.ndim == 3:
-        if pixels.shape[2] >= 3:
-            pixels = pixels[..., :3]
-            gray = pixels @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-        else:
-            gray = pixels[..., 0]
-    else:
-        gray = pixels
-    if gray.max() <= 1.0:
-        gray = gray * 255.0
-    gray = gray.astype(np.float32)
-    threshold = float(np.mean(gray))
-    bw = np.where(gray > threshold, 255, 0).astype(np.uint8)
-    scale = 1.5
-    new_h = max(1, int(bw.shape[0] * scale))
-    new_w = max(1, int(bw.shape[1] * scale))
-    resized = np.repeat(np.repeat(bw, int(np.ceil(scale)), axis=0), int(np.ceil(scale)), axis=1)[:new_h, :new_w]
-    from io import BytesIO
-
-    buf = BytesIO()
-    plt.imsave(buf, resized, cmap="gray", format="png")
-    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
+    with Image.open(image_path) as image:
+        gray = image.convert("L")
+        threshold = int(np.array(gray).mean())
+        bw = gray.point(lambda p: 255 if p > threshold else 0)
+        rgb = bw.convert("RGB")
+        width, height = rgb.size
+        rgb = rgb.resize((max(1, int(width * 1.25)), max(1, int(height * 1.25))), Image.Resampling.LANCZOS)
+        buf = BytesIO()
+        rgb.save(buf, format="JPEG", quality=85, optimize=True)
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii").replace("\n", "")
+    return f"data:image/jpeg;base64,{encoded}"
 
 
 def _call_local_ocr_service(image_data_url: str, prompt: str, timeout_seconds: int) -> dict[str, Any]:
@@ -266,19 +268,25 @@ def _call_local_ocr_service(image_data_url: str, prompt: str, timeout_seconds: i
         ],
         "stream": False,
         "temperature": 0,
+        "max_tokens": 4096,
     }
-    req = urllib.request.Request(
-        _LOCAL_OCR_ENDPOINT,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        response = requests.post(
+            _LOCAL_OCR_ENDPOINT,
+            json=payload,
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        data = response.json()
     except TimeoutError as exc:
-        raise ValueError(f"OCR request timeout after {timeout_seconds}s") from exc
-    except urllib.error.URLError as exc:
+        raise ValueError(
+            f"OCR request timeout after {timeout_seconds}s，请检查 llama-server 后台显存占用情况。"
+        ) from exc
+    except requests.Timeout as exc:
+        raise ValueError(
+            f"OCR request timeout after {timeout_seconds}s，请检查 llama-server 后台显存占用情况。"
+        ) from exc
+    except requests.RequestException as exc:
         raise ValueError(f"OCR service unavailable: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError("OCR service returned invalid JSON.") from exc
@@ -3245,6 +3253,9 @@ def local_ocr_analyze(image_path: str) -> dict[str, Any]:
             if isinstance(retry_message, dict):
                 text = str(retry_message.get("content", "")).strip()
         response_json = retry_response_json
+
+    if text and text.count("$") % 2 == 1:
+        text = f"{text}$"
 
     return {
         "workspace": str(WORKSPACE_DIR),
