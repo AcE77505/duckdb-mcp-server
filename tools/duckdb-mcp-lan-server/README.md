@@ -11,6 +11,13 @@ cd tools/duckdb-mcp-lan-server
 .\start-server.ps1
 ```
 
+Linux / macOS（Bash）：
+
+```bash
+cd tools/duckdb-mcp-lan-server
+./start-server.sh
+```
+
 说明：
 
 - 首次运行会自动创建 `.venv` 并安装依赖
