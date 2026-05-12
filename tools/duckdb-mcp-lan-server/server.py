@@ -52,6 +52,8 @@ _LOCAL_OCR_MODEL = "PaddleOCR-VL-1.5"
 _LOCAL_OCR_TIMEOUT_SECONDS = 120
 _LOCAL_OCR_DEFAULT_SCALE_EDGE = 5000
 _LOCAL_OCR_FORCE_SCALE_EDGE = 2000
+_WORKSPACE_TEXT_SEARCH_MAX_CONTEXT_PERCENT = 100
+_WORKSPACE_TEXT_SEARCH_MAX_LINE_LENGTH_HINT = 1000
 
 
 def _load_mcp_config() -> dict[str, Any]:
@@ -143,6 +145,19 @@ def _resolve_writable_workspace_text_file() -> Path:
         raise ValueError(f"File not found: {file_path}")
     if not file_path.is_file():
         raise ValueError(f"Path is not a file: {file_path}")
+    return file_path
+
+
+def _resolve_workspace_text_file(path: str) -> Path:
+    file_path = _resolve_workspace_path(path)
+    if not file_path.exists():
+        raise ValueError(f"File not found: {file_path}")
+    if not file_path.is_file():
+        raise ValueError(f"Path is not a file: {file_path}")
+    if file_path.suffix.lower() not in {".txt", ".md", ".csv", ".log"}:
+        raise ValueError(
+            "Only text-like files are supported (.txt/.md/.csv/.log)."
+        )
     return file_path
 
 
@@ -2239,6 +2254,86 @@ def workspace_search_files(
         "returned": len(matches),
         "truncated": truncated,
         "matches": matches,
+    }
+
+
+@mcp.tool()
+def workspace_search_text_in_file(
+    file_name: str,
+    query: str,
+    context_percent: int,
+    case_sensitive: bool = False,
+    use_regex: bool = False,
+    max_results: int = 1000,
+) -> dict[str, Any]:
+    """在单个文本文件中搜索内容并返回行号与段落。
+
+    context_percent 表示段落展示范围（相对整行长度），取值 0-100。
+    当值为 100 时最多展示整行。若某行超过 1000 字符，建议将该值调低以节省上下文。
+    """
+    if not file_name or not file_name.strip():
+        raise ValueError("file_name cannot be empty.")
+    if not query or not query.strip():
+        raise ValueError("query cannot be empty.")
+    if context_percent < 0 or context_percent > _WORKSPACE_TEXT_SEARCH_MAX_CONTEXT_PERCENT:
+        raise ValueError("context_percent must be between 0 and 100.")
+    if max_results <= 0 or max_results > 5000:
+        raise ValueError("max_results must be between 1 and 5000.")
+
+    file_path = _resolve_workspace_text_file(file_name)
+    lines = _read_utf8_text(file_path).splitlines()
+    flags = 0 if case_sensitive else re.IGNORECASE
+    if use_regex:
+        try:
+            pattern = re.compile(query, flags)
+        except re.error as exc:
+            raise ValueError(f"Invalid regex pattern: {exc}") from exc
+    else:
+        pattern = re.compile(re.escape(query), flags)
+
+    matches: list[dict[str, Any]] = []
+    truncated = False
+    for line_no, line in enumerate(lines, start=1):
+        line_hits = list(pattern.finditer(line))
+        if not line_hits:
+            continue
+        span_start = min(hit.start() for hit in line_hits)
+        span_end = max(hit.end() for hit in line_hits)
+        line_len = len(line)
+        if context_percent >= 100:
+            snippet_start = 0
+            snippet_end = line_len
+        else:
+            window = max(1, int(line_len * context_percent / 100))
+            center = (span_start + span_end) // 2
+            half = window // 2
+            snippet_start = max(0, center - half)
+            snippet_end = min(line_len, snippet_start + window)
+            snippet_start = max(0, snippet_end - window)
+        matches.append(
+            {
+                "line": line_no,
+                "match_count": len(line_hits),
+                "paragraph": line[snippet_start:snippet_end],
+                "line_too_long_hint": line_len > _WORKSPACE_TEXT_SEARCH_MAX_LINE_LENGTH_HINT,
+            }
+        )
+        if len(matches) >= max_results:
+            truncated = True
+            break
+
+    return {
+        "workspace": str(WORKSPACE_DIR),
+        "path": file_path.relative_to(WORKSPACE_DIR).as_posix(),
+        "file_name": file_name,
+        "query": query,
+        "context_percent": context_percent,
+        "case_sensitive": case_sensitive,
+        "use_regex": use_regex,
+        "matched_targets": sum(item["match_count"] for item in matches),
+        "matched_lines": len(matches),
+        "truncated": truncated,
+        "results": matches,
     }
 
 
